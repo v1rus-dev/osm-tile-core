@@ -1,10 +1,10 @@
-use std::collections::{HashMap, HashSet};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::ffi::c_void;
 use std::path::PathBuf;
 use std::ptr::NonNull;
-use std::sync::mpsc::{self, Receiver, Sender};
 #[cfg(feature = "mobile")]
 use std::sync::Arc;
+use std::sync::mpsc::{self, Receiver, Sender};
 use std::thread::{self, JoinHandle};
 
 use image::GenericImageView;
@@ -57,6 +57,145 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
 const TEXTURED_VERTEX_ATTRIBUTES: [wgpu::VertexAttribute; 2] =
     wgpu::vertex_attr_array![0 => Float32x2, 1 => Float32x2];
 
+const MB: usize = 1024 * 1024;
+const DEFAULT_RAM_TILE_CACHE_LIMIT_BYTES: usize = 96 * MB;
+const DEFAULT_GPU_TILE_CACHE_LIMIT_BYTES: usize = 128 * MB;
+const DEFAULT_MAX_ZOOM_DISTANCE_TO_KEEP: u8 = 2;
+
+#[derive(Debug, Clone, Copy)]
+struct TileCacheLimits {
+    ram_bytes: usize,
+    gpu_bytes: usize,
+    max_zoom_distance_to_keep: u8,
+}
+
+impl Default for TileCacheLimits {
+    fn default() -> Self {
+        Self {
+            ram_bytes: DEFAULT_RAM_TILE_CACHE_LIMIT_BYTES,
+            gpu_bytes: DEFAULT_GPU_TILE_CACHE_LIMIT_BYTES,
+            max_zoom_distance_to_keep: DEFAULT_MAX_ZOOM_DISTANCE_TO_KEEP,
+        }
+    }
+}
+
+#[derive(Debug, Default)]
+struct TileTelemetry {
+    decoded_hit: u64,
+    decoded_miss: u64,
+    decoded_evictions: u64,
+    gpu_hit: u64,
+    gpu_miss: u64,
+    gpu_evictions: u64,
+    upload_count: u64,
+    upload_time_total_ns: u128,
+}
+
+impl TileTelemetry {
+    fn record_upload(&mut self, elapsed: std::time::Duration) {
+        self.upload_count += 1;
+        self.upload_time_total_ns += elapsed.as_nanos();
+    }
+}
+
+#[derive(Debug)]
+struct SizedLruCache<T> {
+    entries: HashMap<TileId, (T, usize)>,
+    order: VecDeque<TileId>,
+    current_size_bytes: usize,
+    size_limit_bytes: usize,
+}
+
+impl<T> SizedLruCache<T> {
+    fn new(size_limit_bytes: usize) -> Self {
+        Self {
+            entries: HashMap::new(),
+            order: VecDeque::new(),
+            current_size_bytes: 0,
+            size_limit_bytes,
+        }
+    }
+
+    fn contains_key(&self, key: &TileId) -> bool {
+        self.entries.contains_key(key)
+    }
+
+    fn touch(&mut self, key: TileId) {
+        if let Some(pos) = self.order.iter().position(|candidate| *candidate == key) {
+            self.order.remove(pos);
+        }
+        self.order.push_back(key);
+    }
+
+    fn insert(&mut self, key: TileId, value: T, size_bytes: usize) {
+        if let Some((_, (_, previous_size))) = self.entries.remove_entry(&key) {
+            self.current_size_bytes = self.current_size_bytes.saturating_sub(previous_size);
+            if let Some(pos) = self.order.iter().position(|candidate| *candidate == key) {
+                self.order.remove(pos);
+            }
+        }
+        self.current_size_bytes = self.current_size_bytes.saturating_add(size_bytes);
+        self.order.push_back(key);
+        self.entries.insert(key, (value, size_bytes));
+    }
+
+    fn get_cloned(&mut self, key: &TileId) -> Option<T>
+    where
+        T: Clone,
+    {
+        let value = self.entries.get(key).map(|(value, _)| value).cloned();
+        if value.is_some() {
+            self.touch(*key);
+        }
+        value
+    }
+
+    fn get(&mut self, key: &TileId) -> Option<&T> {
+        if self.entries.contains_key(key) {
+            self.touch(*key);
+            return self.entries.get(key).map(|(value, _)| value);
+        }
+        None
+    }
+
+    fn peek(&self, key: &TileId) -> Option<&T> {
+        self.entries.get(key).map(|(value, _)| value)
+    }
+
+    fn remove(&mut self, key: &TileId) -> Option<T> {
+        let (value, size_bytes) = self.entries.remove(key)?;
+        self.current_size_bytes = self.current_size_bytes.saturating_sub(size_bytes);
+        if let Some(pos) = self.order.iter().position(|candidate| candidate == key) {
+            self.order.remove(pos);
+        }
+        Some(value)
+    }
+
+    fn evict_one(&mut self, visible_tiles: &HashSet<TileId>) -> Option<TileId> {
+        let mut fallback = None;
+        for (idx, candidate) in self.order.iter().enumerate() {
+            if fallback.is_none() {
+                fallback = Some((idx, *candidate));
+            }
+            if !visible_tiles.contains(candidate) {
+                return Some(self.evict_at(idx));
+            }
+        }
+        fallback.map(|(idx, _)| self.evict_at(idx))
+    }
+
+    fn evict_at(&mut self, idx: usize) -> TileId {
+        let key = self
+            .order
+            .remove(idx)
+            .expect("cache order index should exist");
+        if let Some((_, size_bytes)) = self.entries.remove(&key) {
+            self.current_size_bytes = self.current_size_bytes.saturating_sub(size_bytes);
+        }
+        key
+    }
+}
+
 type ANativeWindow = c_void;
 
 #[link(name = "android")]
@@ -77,7 +216,8 @@ unsafe impl Send for NativeWindow {}
 
 impl NativeWindow {
     fn from_surface(env: &JNIEnv<'_>, surface: &JObject<'_>) -> Option<Self> {
-        let ptr = unsafe { ANativeWindow_fromSurface(env.get_native_interface(), surface.as_raw()) };
+        let ptr =
+            unsafe { ANativeWindow_fromSurface(env.get_native_interface(), surface.as_raw()) };
         NonNull::new(ptr).map(|ptr| Self { ptr })
     }
 
@@ -128,7 +268,13 @@ impl AndroidMapRenderer {
         let tile_loader_source = source.clone();
         let tile_loader = thread::Builder::new()
             .name("osm-map-tile-loader".to_owned())
-            .spawn(move || tile_loader_loop(tile_loader_source, tile_loader_commands, tile_request_receiver))
+            .spawn(move || {
+                tile_loader_loop(
+                    tile_loader_source,
+                    tile_loader_commands,
+                    tile_request_receiver,
+                )
+            })
             .map_err(|error| error.to_string())?;
         let worker_tile_requests = tile_requests.clone();
         let worker = thread::Builder::new()
@@ -169,7 +315,9 @@ impl Drop for AndroidMapRenderer {
 
 #[derive(Debug)]
 enum RenderCommand {
-    SurfaceCreated { window: NativeWindow },
+    SurfaceCreated {
+        window: NativeWindow,
+    },
     SurfaceDestroyed,
     Resize {
         width_px: u32,
@@ -235,10 +383,13 @@ struct RendererWorker {
     state: RenderState,
     surface_width_px: u32,
     surface_height_px: u32,
-    loaded_tiles: HashMap<TileId, LoadedTile>,
+    loaded_tiles: SizedLruCache<LoadedTile>,
     pending_tile_loads: HashSet<TileId>,
     tile_requests: Sender<TileLoaderRequest>,
     gpu: Option<GpuSurface>,
+    telemetry: TileTelemetry,
+    cache_limits: TileCacheLimits,
+    last_visible_zoom: Option<u8>,
 }
 
 struct GpuSurface {
@@ -250,7 +401,7 @@ struct GpuSurface {
     tile_bind_group_layout: wgpu::BindGroupLayout,
     tile_sampler: wgpu::Sampler,
     quad_pipeline: wgpu::RenderPipeline,
-    uploaded_tiles: HashMap<TileId, UploadedTile>,
+    uploaded_tiles: SizedLruCache<UploadedTile>,
     config: Option<wgpu::SurfaceConfiguration>,
     _native_window: NativeWindow,
 }
@@ -261,10 +412,13 @@ impl RendererWorker {
             state,
             surface_width_px: 0,
             surface_height_px: 0,
-            loaded_tiles: HashMap::new(),
+            loaded_tiles: SizedLruCache::new(TileCacheLimits::default().ram_bytes),
             pending_tile_loads: HashSet::new(),
             tile_requests,
             gpu: None,
+            telemetry: TileTelemetry::default(),
+            cache_limits: TileCacheLimits::default(),
+            last_visible_zoom: None,
         }
     }
 
@@ -337,7 +491,11 @@ impl RendererWorker {
                 RenderCommand::TileLoaded { id, tile } => {
                     self.pending_tile_loads.remove(&id);
                     if let Some(tile) = tile {
-                        self.loaded_tiles.insert(id, tile);
+                        let size_bytes = tile.rgba.len();
+                        self.loaded_tiles.insert(id, tile, size_bytes);
+                        self.telemetry.decoded_hit += 1;
+                    } else {
+                        self.telemetry.decoded_miss += 1;
                     }
                     self.render_frame();
                 }
@@ -372,7 +530,9 @@ impl RendererWorker {
         };
 
         if let Some(visible_tiles) = visible_tiles.as_ref() {
+            self.evict_far_zoom_layers(visible_tiles);
             self.ensure_visible_tiles(visible_tiles);
+            self.enforce_cache_limits(visible_tiles);
         }
 
         if let Some(gpu) = self.gpu.as_mut() {
@@ -380,24 +540,27 @@ impl RendererWorker {
         }
     }
 
-    fn ensure_visible_tiles(
-        &mut self,
-        visible_tiles: &[osm_renderer::VisibleTile],
-    ) {
+    fn ensure_visible_tiles(&mut self, visible_tiles: &[osm_renderer::VisibleTile]) {
         for visible_tile in visible_tiles {
             let tile_id = visible_tile.id;
 
             if !self.loaded_tiles.contains_key(&tile_id)
                 && !self.pending_tile_loads.contains(&tile_id)
             {
+                self.telemetry.decoded_miss += 1;
                 self.pending_tile_loads.insert(tile_id);
                 let _ = self.tile_requests.send(TileLoaderRequest::Load(tile_id));
+            } else if self.loaded_tiles.contains_key(&tile_id) {
+                self.telemetry.decoded_hit += 1;
             }
 
-            let tile_data = self.loaded_tiles.get(&tile_id).cloned();
+            let tile_data = self.loaded_tiles.get_cloned(&tile_id);
             if let (Some(gpu), Some(tile_data)) = (self.gpu.as_mut(), tile_data) {
                 if !gpu.uploaded_tiles.contains_key(&tile_id) {
-                    gpu.upload_tile(tile_id, &tile_data);
+                    self.telemetry.gpu_miss += 1;
+                    gpu.upload_tile(tile_id, &tile_data, &mut self.telemetry);
+                } else {
+                    self.telemetry.gpu_hit += 1;
                 }
             }
         }
@@ -409,6 +572,65 @@ impl RendererWorker {
                 && layer.common().visible
                 && layer.common().opacity > 0.0
         })
+    }
+
+    fn enforce_cache_limits(&mut self, visible_tiles: &[osm_renderer::VisibleTile]) {
+        let visible_ids: HashSet<TileId> = visible_tiles.iter().map(|tile| tile.id).collect();
+        while self.loaded_tiles.current_size_bytes > self.loaded_tiles.size_limit_bytes {
+            if self.loaded_tiles.evict_one(&visible_ids).is_none() {
+                break;
+            }
+            self.telemetry.decoded_evictions += 1;
+        }
+        if let Some(gpu) = self.gpu.as_mut() {
+            while gpu.uploaded_tiles.current_size_bytes > gpu.uploaded_tiles.size_limit_bytes {
+                if gpu.uploaded_tiles.evict_one(&visible_ids).is_none() {
+                    break;
+                }
+                self.telemetry.gpu_evictions += 1;
+            }
+        }
+    }
+
+    fn evict_far_zoom_layers(&mut self, visible_tiles: &[osm_renderer::VisibleTile]) {
+        let Some(current_zoom) = visible_tiles.first().map(|tile| tile.id.z) else {
+            return;
+        };
+        let changed = self
+            .last_visible_zoom
+            .map(|previous| previous != current_zoom)
+            .unwrap_or(false);
+        self.last_visible_zoom = Some(current_zoom);
+        if !changed {
+            return;
+        }
+        let max_distance = self.cache_limits.max_zoom_distance_to_keep;
+        let stale_loaded: Vec<TileId> = self
+            .loaded_tiles
+            .entries
+            .keys()
+            .copied()
+            .filter(|tile_id| tile_id.z.abs_diff(current_zoom) > max_distance)
+            .collect();
+        for tile_id in stale_loaded {
+            if self.loaded_tiles.remove(&tile_id).is_some() {
+                self.telemetry.decoded_evictions += 1;
+            }
+        }
+        if let Some(gpu) = self.gpu.as_mut() {
+            let stale_gpu: Vec<TileId> = gpu
+                .uploaded_tiles
+                .entries
+                .keys()
+                .copied()
+                .filter(|tile_id| tile_id.z.abs_diff(current_zoom) > max_distance)
+                .collect();
+            for tile_id in stale_gpu {
+                if gpu.uploaded_tiles.remove(&tile_id).is_some() {
+                    self.telemetry.gpu_evictions += 1;
+                }
+            }
+        }
     }
 }
 
@@ -446,10 +668,7 @@ fn tile_loader_loop(
 }
 
 impl GpuSurface {
-    fn new(
-        native_window: NativeWindow,
-        runtime: &tokio::runtime::Runtime,
-    ) -> Result<Self, String> {
+    fn new(native_window: NativeWindow, runtime: &tokio::runtime::Runtime) -> Result<Self, String> {
         let instance = wgpu::Instance::default();
         let raw_window_handle =
             wgpu::rwh::AndroidNdkWindowHandle::new(native_window.raw_handle()).into();
@@ -563,7 +782,7 @@ impl GpuSurface {
             tile_bind_group_layout,
             tile_sampler,
             quad_pipeline,
-            uploaded_tiles: HashMap::new(),
+            uploaded_tiles: SizedLruCache::new(TileCacheLimits::default().gpu_bytes),
             config: None,
             _native_window: native_window,
         })
@@ -586,7 +805,8 @@ impl GpuSurface {
         self.config = Some(config);
     }
 
-    fn upload_tile(&mut self, tile_id: TileId, tile: &LoadedTile) {
+    fn upload_tile(&mut self, tile_id: TileId, tile: &LoadedTile, telemetry: &mut TileTelemetry) {
+        let upload_started = std::time::Instant::now();
         let size = wgpu::Extent3d {
             width: tile.width,
             height: tile.height,
@@ -629,13 +849,16 @@ impl GpuSurface {
             ],
         });
 
+        let texture_size_bytes = tile.width as usize * tile.height as usize * 4;
         self.uploaded_tiles.insert(
             tile_id,
             UploadedTile {
                 _texture: texture,
                 bind_group,
             },
+            texture_size_bytes,
         );
+        telemetry.record_upload(upload_started.elapsed());
     }
 
     fn render(&mut self, visible_tiles: Option<&[osm_renderer::VisibleTile]>) {
@@ -694,7 +917,8 @@ impl GpuSurface {
                 let Some(tile_draw) = self.resolve_tile_draw(visible_tile.id) else {
                     continue;
                 };
-                let vertex_start = batch_vertices.len() as u64 * std::mem::size_of::<TexturedVertex>() as u64;
+                let vertex_start =
+                    batch_vertices.len() as u64 * std::mem::size_of::<TexturedVertex>() as u64;
                 let vertices = tile_vertices(
                     visible_tile.screen_x_px,
                     visible_tile.screen_y_px,
@@ -703,7 +927,9 @@ impl GpuSurface {
                     tile_draw.uv_right,
                     tile_draw.uv_top,
                     tile_draw.uv_bottom,
-                    self.config.as_ref().expect("surface configuration should exist"),
+                    self.config
+                        .as_ref()
+                        .expect("surface configuration should exist"),
                 );
                 batch_vertices.extend_from_slice(&vertices);
                 batch_draws.push((vertex_start, tile_draw.bind_group));
@@ -717,26 +943,27 @@ impl GpuSurface {
                             contents: bytes_of(&batch_vertices),
                             usage: wgpu::BufferUsages::VERTEX,
                         });
-            let mut render_pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
-                label: Some("osm-map-renderer-tile-pass"),
-                color_attachments: &[Some(wgpu::RenderPassColorAttachment {
-                    view: &view,
-                    resolve_target: None,
-                    ops: wgpu::Operations {
-                        load: wgpu::LoadOp::Load,
-                        store: wgpu::StoreOp::Store,
-                    },
-                    depth_slice: None,
-                })],
-                depth_stencil_attachment: None,
-                timestamp_writes: None,
-                occlusion_query_set: None,
-                multiview_mask: None,
-            });
-            render_pass.set_pipeline(&self.quad_pipeline);
+                let mut render_pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                    label: Some("osm-map-renderer-tile-pass"),
+                    color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                        view: &view,
+                        resolve_target: None,
+                        ops: wgpu::Operations {
+                            load: wgpu::LoadOp::Load,
+                            store: wgpu::StoreOp::Store,
+                        },
+                        depth_slice: None,
+                    })],
+                    depth_stencil_attachment: None,
+                    timestamp_writes: None,
+                    occlusion_query_set: None,
+                    multiview_mask: None,
+                });
+                render_pass.set_pipeline(&self.quad_pipeline);
 
                 for (vertex_start, bind_group) in batch_draws {
-                    let vertex_end = vertex_start + (6 * std::mem::size_of::<TexturedVertex>()) as u64;
+                    let vertex_end =
+                        vertex_start + (6 * std::mem::size_of::<TexturedVertex>()) as u64;
                     render_pass.set_bind_group(0, bind_group, &[]);
                     render_pass.set_vertex_buffer(0, vertex_buffer.slice(vertex_start..vertex_end));
                     render_pass.draw(0..6, 0..1);
@@ -749,7 +976,7 @@ impl GpuSurface {
     }
 
     fn resolve_tile_draw(&self, tile_id: TileId) -> Option<TileDrawRef<'_>> {
-        if let Some(uploaded_tile) = self.uploaded_tiles.get(&tile_id) {
+        if let Some(uploaded_tile) = self.uploaded_tiles.peek(&tile_id) {
             return Some(TileDrawRef {
                 bind_group: &uploaded_tile.bind_group,
                 uv_left: 0.0,
@@ -774,7 +1001,7 @@ impl GpuSurface {
                 y: ancestor.y / 2,
             };
 
-            if let Some(uploaded_tile) = self.uploaded_tiles.get(&ancestor) {
+            if let Some(uploaded_tile) = self.uploaded_tiles.peek(&ancestor) {
                 let factor = scale_divisor as f32;
                 let uv_left = child_offset_x as f32 / factor;
                 let uv_right = (child_offset_x + 1) as f32 / factor;
@@ -840,12 +1067,7 @@ fn tile_vertices(
 }
 
 fn bytes_of<T>(slice: &[T]) -> &[u8] {
-    unsafe {
-        std::slice::from_raw_parts(
-            slice.as_ptr().cast::<u8>(),
-            std::mem::size_of_val(slice),
-        )
-    }
+    unsafe { std::slice::from_raw_parts(slice.as_ptr().cast::<u8>(), std::mem::size_of_val(slice)) }
 }
 
 fn renderer_from_ptr<'a>(ptr: jlong) -> Option<&'a AndroidMapRenderer> {
@@ -908,11 +1130,7 @@ fn native_create_renderer_from_engine(engine_handle: jlong) -> jlong {
     }
 }
 
-fn native_surface_created(
-    env: JNIEnv<'_>,
-    ptr: jlong,
-    surface: JObject<'_>,
-) {
+fn native_surface_created(env: JNIEnv<'_>, ptr: jlong, surface: JObject<'_>) {
     let Some(window) = NativeWindow::from_surface(&env, &surface) else {
         return;
     };
@@ -922,12 +1140,7 @@ fn native_surface_created(
     }
 }
 
-fn native_surface_changed(
-    ptr: jlong,
-    width_px: jint,
-    height_px: jint,
-    density: jfloat,
-) {
+fn native_surface_changed(ptr: jlong, width_px: jint, height_px: jint, density: jfloat) {
     if width_px <= 0 || height_px <= 0 {
         return;
     }
@@ -962,17 +1175,13 @@ fn native_set_camera(
     }
 }
 
-fn native_surface_destroyed(
-    ptr: jlong,
-) {
+fn native_surface_destroyed(ptr: jlong) {
     if let Some(renderer) = renderer_from_ptr(ptr) {
         renderer.send(RenderCommand::SurfaceDestroyed);
     }
 }
 
-fn native_destroy_renderer(
-    ptr: jlong,
-) {
+fn native_destroy_renderer(ptr: jlong) {
     take_renderer_from_ptr(ptr);
 }
 
@@ -1001,11 +1210,7 @@ fn native_add_tile_layer(
     }
 }
 
-fn native_remove_layer(
-    mut env: JNIEnv<'_>,
-    ptr: jlong,
-    layer_id: JString<'_>,
-) {
+fn native_remove_layer(mut env: JNIEnv<'_>, ptr: jlong, layer_id: JString<'_>) {
     let Some(layer_id) = java_string(&mut env, &layer_id) else {
         return;
     };
