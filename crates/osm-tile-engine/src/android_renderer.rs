@@ -5,7 +5,7 @@ use std::path::PathBuf;
 use std::ptr::NonNull;
 #[cfg(feature = "mobile")]
 use std::sync::Arc;
-use std::sync::mpsc::{self, Receiver, Sender};
+use std::sync::mpsc::{self, Receiver, RecvTimeoutError, Sender};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
@@ -404,6 +404,8 @@ struct RendererWorker {
     telemetry: TileTelemetry,
     cache_limits: TileCacheLimits,
     last_visible_zoom: Option<u32>,
+    needs_render: bool,
+    render_in_flight: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
@@ -467,6 +469,8 @@ impl RendererWorker {
             telemetry: TileTelemetry::default(),
             cache_limits: TileCacheLimits::default(),
             last_visible_zoom: None,
+            needs_render: false,
+            render_in_flight: false,
         }
     }
 
@@ -476,91 +480,140 @@ impl RendererWorker {
             Err(_) => return,
         };
 
-        while let Ok(command) = receiver.recv() {
-            match command {
-                RenderCommand::SurfaceCreated { window } => {
-                    self.create_gpu_surface(window, &runtime);
-                    self.render_frame();
-                }
-                RenderCommand::SurfaceDestroyed => self.gpu = None,
-                RenderCommand::Resize {
-                    width_px,
-                    height_px,
-                    density,
-                } => {
-                    self.surface_width_px = width_px;
-                    self.surface_height_px = height_px;
-                    if let Some(gpu) = self.gpu.as_mut() {
-                        gpu.configure(width_px, height_px);
+        loop {
+            let timeout = self.time_until_next_frame();
+            let recv_result = match timeout {
+                Some(timeout) => receiver.recv_timeout(timeout),
+                None => receiver.recv().map_err(|_| RecvTimeoutError::Disconnected),
+            };
+
+            match recv_result {
+                Ok(command) => match command {
+                    RenderCommand::SurfaceCreated { window } => {
+                        self.create_gpu_surface(window, &runtime);
+                        self.mark_needs_render();
                     }
-                    if let Ok(viewport) = RenderViewport::new(width_px, height_px, density) {
-                        let _ = self.state.set_viewport(viewport);
-                        self.render_frame();
-                    }
-                }
-                RenderCommand::SetCamera(camera) => {
-                    self.update_camera_velocity_hint(camera);
-                    let _ = self.state.set_camera(camera);
-                    self.request_generation = self.request_generation.saturating_add(1);
-                    self.update_camera_motion(camera);
-                    self.render_frame();
-                }
-                RenderCommand::AddTileLayer {
-                    id,
-                    url_template,
-                    z_index,
-                    opacity,
-                } => {
-                    if let Ok(id) = LayerId::new(id) {
-                        let mut layer = TileLayer::new(id, url_template, z_index);
-                        layer.common.opacity = opacity;
-                        let _ = self
-                            .state
-                            .layers_mut()
-                            .add_or_replace(MapLayer::Tile(layer));
-                        self.render_frame();
-                    }
-                }
-                RenderCommand::RemoveLayer(id) => {
-                    if let Ok(id) = LayerId::new(id) {
-                        self.state.layers_mut().remove(&id);
-                        self.render_frame();
-                    }
-                }
-                RenderCommand::SetLayerVisible { id, visible } => {
-                    if let Ok(id) = LayerId::new(id) {
-                        let _ = self.state.layers_mut().set_visible(&id, visible);
-                        self.render_frame();
-                    }
-                }
-                RenderCommand::SetLayerOpacity { id, opacity } => {
-                    if let Ok(id) = LayerId::new(id) {
-                        let _ = self.state.layers_mut().set_opacity(&id, opacity);
-                        self.render_frame();
-                    }
-                }
-                RenderCommand::TileLoaded { id, tile, metadata } => {
-                    let is_current = self
-                        .pending_metadata
-                        .get(&id)
-                        .map(|current| current.generation == metadata.generation)
-                        .unwrap_or(false);
-                    self.pending_tile_loads.remove(&id);
-                    if is_current {
-                        self.pending_metadata.remove(&id);
-                        if let Some(tile) = tile {
-                            let size_bytes = tile.rgba.len();
-                            self.loaded_tiles.insert(id, tile, size_bytes);
-                            self.telemetry.decoded_hit += 1;
-                        } else {
-                            self.telemetry.decoded_miss += 1;
+                    RenderCommand::SurfaceDestroyed => self.gpu = None,
+                    RenderCommand::Resize {
+                        width_px,
+                        height_px,
+                        density,
+                    } => {
+                        self.surface_width_px = width_px;
+                        self.surface_height_px = height_px;
+                        if let Some(gpu) = self.gpu.as_mut() {
+                            gpu.configure(width_px, height_px);
                         }
-                        self.render_frame();
+                        if let Ok(viewport) = RenderViewport::new(width_px, height_px, density) {
+                            let _ = self.state.set_viewport(viewport);
+                            self.mark_needs_render();
+                        }
                     }
+                    RenderCommand::SetCamera(camera) => {
+                        self.update_camera_velocity_hint(camera);
+                        let _ = self.state.set_camera(camera);
+                        self.request_generation = self.request_generation.saturating_add(1);
+                        self.update_camera_motion(camera);
+                        self.mark_needs_render();
+                    }
+                    RenderCommand::AddTileLayer {
+                        id,
+                        url_template,
+                        z_index,
+                        opacity,
+                    } => {
+                        if let Ok(id) = LayerId::new(id) {
+                            let mut layer = TileLayer::new(id, url_template, z_index);
+                            layer.common.opacity = opacity;
+                            let _ = self
+                                .state
+                                .layers_mut()
+                                .add_or_replace(MapLayer::Tile(layer));
+                            self.mark_needs_render();
+                        }
+                    }
+                    RenderCommand::RemoveLayer(id) => {
+                        if let Ok(id) = LayerId::new(id) {
+                            self.state.layers_mut().remove(&id);
+                            self.mark_needs_render();
+                        }
+                    }
+                    RenderCommand::SetLayerVisible { id, visible } => {
+                        if let Ok(id) = LayerId::new(id) {
+                            let _ = self.state.layers_mut().set_visible(&id, visible);
+                            self.mark_needs_render();
+                        }
+                    }
+                    RenderCommand::SetLayerOpacity { id, opacity } => {
+                        if let Ok(id) = LayerId::new(id) {
+                            let _ = self.state.layers_mut().set_opacity(&id, opacity);
+                            self.mark_needs_render();
+                        }
+                    }
+                    RenderCommand::TileLoaded { id, tile, metadata } => {
+                        let is_current = self
+                            .pending_metadata
+                            .get(&id)
+                            .map(|current| current.generation == metadata.generation)
+                            .unwrap_or(false);
+                        self.pending_tile_loads.remove(&id);
+                        if is_current {
+                            self.pending_metadata.remove(&id);
+                            if let Some(tile) = tile {
+                                let size_bytes = tile.rgba.len();
+                                self.loaded_tiles.insert(id, tile, size_bytes);
+                                self.telemetry.decoded_hit += 1;
+                            } else {
+                                self.telemetry.decoded_miss += 1;
+                            }
+                            self.mark_needs_render();
+                        }
+                    }
+                    RenderCommand::Shutdown => break,
+                },
+                Err(RecvTimeoutError::Timeout) => {
+                    self.render_if_due();
                 }
-                RenderCommand::Shutdown => break,
+                Err(RecvTimeoutError::Disconnected) => break,
+            }
+
+            self.render_if_due();
+        }
+    }
+
+    fn mark_needs_render(&mut self) {
+        self.needs_render = true;
+    }
+
+    fn time_until_next_frame(&self) -> Option<Duration> {
+        if !self.needs_render || self.render_in_flight {
+            return None;
+        }
+
+        if let Some(last_frame) = self.frame_timing.last_frame {
+            let elapsed = last_frame.elapsed();
+            Some(self.frame_timing.frame_interval.saturating_sub(elapsed))
+        } else {
+            Some(Duration::ZERO)
+        }
+    }
+
+    fn render_if_due(&mut self) {
+        if !self.needs_render || self.render_in_flight {
+            return;
+        }
+
+        if let Some(last_frame) = self.frame_timing.last_frame {
+            let elapsed = last_frame.elapsed();
+            if elapsed < self.frame_timing.frame_interval {
+                return;
             }
         }
+
+        self.render_in_flight = true;
+        self.needs_render = false;
+        self.render_frame();
+        self.render_in_flight = false;
     }
 
     fn create_gpu_surface(&mut self, window: NativeWindow, runtime: &tokio::runtime::Runtime) {
