@@ -100,9 +100,12 @@ impl RenderViewport {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, Copy, PartialEq)]
 pub struct VisibleTile {
     pub id: TileId,
+    pub screen_x_px: f32,
+    pub screen_y_px: f32,
+    pub size_px: f32,
 }
 
 pub fn visible_tiles(
@@ -124,6 +127,9 @@ pub fn visible_tiles(
     let max_tile_y = ((center_y + half_height_world_px) / TILE_SIZE_PX).floor() as i64;
     let limit = 1_i64 << zoom;
     let mut tiles = Vec::new();
+    let half_width_screen_px = viewport.width_px as f64 / 2.0;
+    let half_height_screen_px = viewport.height_px as f64 / 2.0;
+    let tile_size_screen_px = (TILE_SIZE_PX * scale) as f32;
 
     for y in min_tile_y..=max_tile_y {
         if y < 0 || y >= limit {
@@ -133,13 +139,26 @@ pub fn visible_tiles(
         for x in min_tile_x..=max_tile_x {
             let wrapped_x = x.rem_euclid(limit);
             let id = TileId::new(zoom, wrapped_x as u32, y as u32)?;
-            if !tiles.iter().any(|tile: &VisibleTile| tile.id == id) {
-                tiles.push(VisibleTile { id });
-            }
+            let tile_world_left_px = x as f64 * TILE_SIZE_PX;
+            let tile_world_top_px = y as f64 * TILE_SIZE_PX;
+            let screen_x_px =
+                ((tile_world_left_px - center_x) * scale + half_width_screen_px) as f32;
+            let screen_y_px =
+                ((tile_world_top_px - center_y) * scale + half_height_screen_px) as f32;
+            tiles.push(VisibleTile {
+                id,
+                screen_x_px,
+                screen_y_px,
+                size_px: tile_size_screen_px,
+            });
         }
     }
 
-    tiles.sort_by_key(|tile| (tile.id.z, tile.id.y, tile.id.x));
+    tiles.sort_by(|left, right| {
+        left.screen_y_px
+            .total_cmp(&right.screen_y_px)
+            .then_with(|| left.screen_x_px.total_cmp(&right.screen_x_px))
+    });
     Ok(tiles)
 }
 

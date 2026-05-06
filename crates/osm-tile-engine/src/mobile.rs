@@ -272,6 +272,14 @@ impl OsmTileEngine {
                 details: "marker state lock is poisoned".to_owned(),
             })
     }
+
+    pub(crate) fn shared_source(&self) -> CachedTileSource<HttpTileSource> {
+        self.source.clone()
+    }
+
+    pub(crate) fn tile_url_template(&self) -> String {
+        self.source.source().url_template().to_owned()
+    }
 }
 
 impl MobileViewport {

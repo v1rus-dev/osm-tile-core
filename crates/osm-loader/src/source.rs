@@ -30,6 +30,10 @@ impl HttpTileSource {
         })
     }
 
+    pub fn url_template(&self) -> &str {
+        &self.url_template
+    }
+
     pub fn tile_url(&self, id: TileId) -> String {
         self.url_template
             .replace("{z}", &id.z.to_string())
