@@ -1485,7 +1485,11 @@ fn newest_generation(queue: &BinaryHeap<PrioritizedTileRequest>, fallback: u64) 
 
 impl GpuSurface {
     fn new(native_window: NativeWindow, runtime: &tokio::runtime::Runtime) -> Result<Self, String> {
-        let instance = wgpu::Instance::default();
+        let instance = wgpu::Instance::new(&wgpu::InstanceDescriptor {
+            backends: wgpu::Backends::GL,
+            ..Default::default()
+        });
+        log_info("using OpenGL backend for Android wgpu surface");
         let raw_window_handle =
             wgpu::rwh::AndroidNdkWindowHandle::new(native_window.raw_handle()).into();
         let raw_display_handle = wgpu::rwh::AndroidDisplayHandle::new().into();
