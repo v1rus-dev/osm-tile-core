@@ -5,8 +5,10 @@ import android.graphics.Color
 import android.graphics.drawable.GradientDrawable
 import android.util.AttributeSet
 import android.util.TypedValue
+import android.view.GestureDetector
 import android.view.Gravity
 import android.view.MotionEvent
+import android.view.Choreographer
 import android.view.ScaleGestureDetector
 import android.view.SurfaceHolder
 import android.view.SurfaceView
@@ -15,6 +17,7 @@ import android.widget.LinearLayout
 import android.widget.TextView
 import androidx.annotation.Keep
 import kotlin.math.ln
+import kotlin.math.exp
 import java.util.Locale
 
 @Keep
@@ -23,12 +26,32 @@ class OsmMapView @JvmOverloads constructor(
     attrs: AttributeSet? = null,
     defStyleAttr: Int = 0,
 ) : FrameLayout(context, attrs, defStyleAttr), SurfaceHolder.Callback {
+    enum class FlingMode {
+        INERTIAL,
+        STOP_ON_RELEASE,
+    }
+
+    data class FlingConfig(
+        val enabled: Boolean = true,
+        val mode: FlingMode = FlingMode.INERTIAL,
+        val friction: Float = 4.2f,
+        val velocityMultiplier: Float = 1f,
+        val maxDurationMs: Long = 1400L,
+        val minVelocityThreshold: Float = 45f,
+    )
+
     private var surfaceReady = false
     private var surfaceWidth = 0
     private var surfaceHeight = 0
     private var lastTouchX = 0f
     private var lastTouchY = 0f
     private var dragging = false
+    private var flingConfig = FlingConfig()
+    private var flingVelocityX = 0.0
+    private var flingVelocityY = 0.0
+    private var flingStartNs = 0L
+    private var flingLastFrameNs = 0L
+    private var flingRunning = false
 
     private var tileUrlTemplate: String = ""
     private var cacheDir: String = context.filesDir.resolve(DEFAULT_CACHE_DIR).absolutePath
@@ -55,6 +78,29 @@ class OsmMapView @JvmOverloads constructor(
             }
         },
     )
+    private val gestureDetector = GestureDetector(
+        context,
+        object : GestureDetector.SimpleOnGestureListener() {
+            override fun onDown(e: MotionEvent): Boolean {
+                stopFling()
+                return true
+            }
+
+            override fun onFling(
+                e1: MotionEvent?,
+                e2: MotionEvent,
+                velocityX: Float,
+                velocityY: Float,
+            ): Boolean {
+                if (!flingConfig.enabled || flingConfig.mode != FlingMode.INERTIAL) return false
+                startFling(velocityX, velocityY)
+                return true
+            }
+        },
+    )
+    private val flingFrameCallback = Choreographer.FrameCallback { frameTimeNs ->
+        stepFling(frameTimeNs)
+    }
 
     init {
         mapSurfaceView.layoutParams = LayoutParams(
@@ -352,10 +398,12 @@ class OsmMapView @JvmOverloads constructor(
     }
 
     private fun handleTouchEvent(event: MotionEvent): Boolean {
+        gestureDetector.onTouchEvent(event)
         scaleDetector.onTouchEvent(event)
 
         when (event.actionMasked) {
             MotionEvent.ACTION_DOWN -> {
+                stopFling()
                 dragging = true
                 lastTouchX = event.x
                 lastTouchY = event.y
@@ -378,6 +426,9 @@ class OsmMapView @JvmOverloads constructor(
             }
             MotionEvent.ACTION_UP, MotionEvent.ACTION_CANCEL -> {
                 dragging = false
+                if (flingConfig.mode == FlingMode.STOP_ON_RELEASE) {
+                    stopFling()
+                }
                 this.parent?.requestDisallowInterceptTouchEvent(false)
                 return true
             }
@@ -403,6 +454,66 @@ class OsmMapView @JvmOverloads constructor(
             ),
             CameraChangeReason.GESTURE,
         )
+    }
+
+    fun setFlingConfig(config: FlingConfig) {
+        flingConfig = config
+        if (!config.enabled) {
+            stopFling()
+        }
+    }
+
+    fun getFlingConfig(): FlingConfig = flingConfig
+
+    private fun startFling(velocityX: Float, velocityY: Float) {
+        val speedX = velocityX * flingConfig.velocityMultiplier
+        val speedY = velocityY * flingConfig.velocityMultiplier
+        val speed = kotlin.math.hypot(speedX.toDouble(), speedY.toDouble()).toFloat()
+        if (speed < flingConfig.minVelocityThreshold) return
+        stopFling()
+        flingVelocityX = speedX.toDouble()
+        flingVelocityY = speedY.toDouble()
+        flingStartNs = 0L
+        flingLastFrameNs = 0L
+        flingRunning = true
+        Choreographer.getInstance().postFrameCallback(flingFrameCallback)
+    }
+
+    private fun stopFling() {
+        if (!flingRunning) return
+        flingRunning = false
+        Choreographer.getInstance().removeFrameCallback(flingFrameCallback)
+    }
+
+    private fun stepFling(frameTimeNs: Long) {
+        if (!flingRunning || surfaceWidth <= 0 || surfaceHeight <= 0) {
+            stopFling()
+            return
+        }
+        if (flingStartNs == 0L) {
+            flingStartNs = frameTimeNs
+            flingLastFrameNs = frameTimeNs
+            Choreographer.getInstance().postFrameCallback(flingFrameCallback)
+            return
+        }
+        val dtSec = ((frameTimeNs - flingLastFrameNs).coerceAtLeast(0L)).toDouble() / 1_000_000_000.0
+        flingLastFrameNs = frameTimeNs
+        val elapsedMs = (frameTimeNs - flingStartNs) / 1_000_000L
+
+        val decay = exp((-flingConfig.friction * dtSec).toDouble())
+        flingVelocityX *= decay
+        flingVelocityY *= decay
+
+        val dx = (flingVelocityX * dtSec).toFloat()
+        val dy = (flingVelocityY * dtSec).toFloat()
+        panBy(dx, dy)
+
+        val remainingSpeed = kotlin.math.hypot(flingVelocityX, flingVelocityY).toFloat()
+        if (remainingSpeed < flingConfig.minVelocityThreshold || elapsedMs >= flingConfig.maxDurationMs) {
+            stopFling()
+            return
+        }
+        Choreographer.getInstance().postFrameCallback(flingFrameCallback)
     }
 
     private fun zoomBy(scaleFactor: Double, focusX: Float, focusY: Float) {
