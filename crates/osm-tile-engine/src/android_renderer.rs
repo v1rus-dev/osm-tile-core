@@ -6,6 +6,7 @@ use std::ptr::NonNull;
 #[cfg(feature = "mobile")]
 use std::sync::Arc;
 use std::sync::mpsc::{self, Receiver, RecvTimeoutError, Sender};
+use std::sync::mpsc::{self, TryRecvError};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
@@ -91,9 +92,30 @@ struct TileTelemetry {
     gpu_evictions: u64,
     upload_count: u64,
     upload_time_total_ns: u128,
+    fetch_count: u64,
+    fetch_time_total_ns: u128,
+    decode_count: u64,
+    decode_time_total_ns: u128,
 }
 
 impl TileTelemetry {
+    fn avg_decode_ms(&self) -> f64 {
+        if self.decode_count == 0 {
+            return 0.0;
+        }
+        self.decode_time_total_ns as f64 / self.decode_count as f64 / 1_000_000.0
+    }
+
+    fn record_fetch(&mut self, elapsed: std::time::Duration) {
+        self.fetch_count += 1;
+        self.fetch_time_total_ns += elapsed.as_nanos();
+    }
+
+    fn record_decode(&mut self, elapsed: std::time::Duration) {
+        self.decode_count += 1;
+        self.decode_time_total_ns += elapsed.as_nanos();
+    }
+
     fn record_upload(&mut self, elapsed: std::time::Duration) {
         self.upload_count += 1;
         self.upload_time_total_ns += elapsed.as_nanos();
@@ -338,6 +360,8 @@ enum RenderCommand {
         id: TileId,
         tile: Option<LoadedTile>,
         metadata: TileRequestMetadata,
+        fetch_elapsed: Duration,
+        decode_elapsed: Duration,
     },
     Shutdown,
 }
@@ -345,6 +369,22 @@ enum RenderCommand {
 enum TileLoaderRequest {
     Load(TileLoadRequest),
     Shutdown,
+}
+
+#[derive(Debug)]
+struct FetchedTile {
+    request: TileLoadRequest,
+    bytes: Option<Vec<u8>>,
+    fetch_elapsed: Duration,
+}
+
+#[derive(Debug)]
+struct DecodedTileResult {
+    id: TileId,
+    metadata: TileRequestMetadata,
+    tile: Option<LoadedTile>,
+    fetch_elapsed: Duration,
+    decode_elapsed: Duration,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -373,6 +413,31 @@ struct TexturedVertex {
     uv: [f32; 2],
 }
 
+const RAW_RGBA_CACHE_MAGIC: &[u8; 8] = b"OSMRGBA1";
+
+fn decode_tile_bytes(bytes: Vec<u8>) -> Option<LoadedTile> {
+    if bytes.len() > 16 && &bytes[..8] == RAW_RGBA_CACHE_MAGIC {
+        let width = u32::from_le_bytes(bytes[8..12].try_into().ok()?);
+        let height = u32::from_le_bytes(bytes[12..16].try_into().ok()?);
+        let rgba = bytes[16..].to_vec();
+        let expected = width.checked_mul(height)?.checked_mul(4)? as usize;
+        if rgba.len() == expected {
+            return Some(LoadedTile {
+                width,
+                height,
+                rgba,
+            });
+        }
+    }
+
+    let image = image::load_from_memory(&bytes).ok()?;
+    let (width, height) = image.dimensions();
+    Some(LoadedTile {
+        width,
+        height,
+        rgba: image.to_rgba8().into_raw(),
+    })
+}
 struct UploadedTile {
     _texture: wgpu::Texture,
     bind_group: wgpu::BindGroup,
@@ -550,7 +615,13 @@ impl RendererWorker {
                             self.mark_needs_render();
                         }
                     }
-                    RenderCommand::TileLoaded { id, tile, metadata } => {
+                    RenderCommand::TileLoaded {
+                        id,
+                        tile,
+                        metadata,
+                        fetch_elapsed,
+                        decode_elapsed,
+                    } => {
                         let is_current = self
                             .pending_metadata
                             .get(&id)
@@ -558,6 +629,8 @@ impl RendererWorker {
                             .unwrap_or(false);
                         self.pending_tile_loads.remove(&id);
                         if is_current {
+                            self.telemetry.record_fetch(fetch_elapsed);
+                            self.telemetry.record_decode(decode_elapsed);
                             self.pending_metadata.remove(&id);
                             if let Some(tile) = tile {
                                 let size_bytes = tile.rgba.len();
@@ -856,9 +929,10 @@ impl RendererWorker {
 
     fn prefetch_budget(&self) -> usize {
         let ms = self.frame_timing.frame_interval.as_millis();
-        if ms > 40 {
+        let decode_ms = self.telemetry.avg_decode_ms();
+        if ms > 40 || decode_ms > 14.0 {
             4
-        } else if ms > 24 {
+        } else if ms > 24 || decode_ms > 8.0 {
             8
         } else {
             12
@@ -986,21 +1060,53 @@ fn tile_loader_loop(
     commands: Sender<RenderCommand>,
     receiver: Receiver<TileLoaderRequest>,
 ) {
-    const MAX_CONCURRENT_LOADS: usize = 8;
+    const MAX_CONCURRENT_FETCHES: usize = 8;
+    const DECODE_QUEUE_BOUND: usize = 32;
+
     let runtime = match tokio::runtime::Runtime::new() {
         Ok(runtime) => runtime,
         Err(_) => return,
     };
+
+    let decode_workers = std::thread::available_parallelism()
+        .map(|cpus| usize::max(1, cpus.get() / 2))
+        .unwrap_or(1);
+    let (decode_tx, decode_rx) = mpsc::sync_channel::<FetchedTile>(DECODE_QUEUE_BOUND);
+    let (decoded_tx, decoded_rx) = mpsc::channel::<DecodedTileResult>();
+
+    let decode_rx = std::sync::Arc::new(std::sync::Mutex::new(decode_rx));
+    let mut decode_threads = Vec::with_capacity(decode_workers);
+    for _ in 0..decode_workers {
+        let rx = decode_rx.clone();
+        let tx = decoded_tx.clone();
+        decode_threads.push(std::thread::spawn(move || {
+            loop {
+                let fetched = {
+                    let guard = rx.lock().expect("decode queue lock poisoned");
+                    guard.recv()
+                };
+                let Ok(fetched) = fetched else { break };
+                let decode_started = Instant::now();
+                let tile = fetched.bytes.and_then(decode_tile_bytes);
+                let _ = tx.send(DecodedTileResult {
+                    id: fetched.request.id,
+                    metadata: fetched.request.metadata,
+                    tile,
+                    fetch_elapsed: fetched.fetch_elapsed,
+                    decode_elapsed: decode_started.elapsed(),
+                });
+            }
+        }));
+    }
+
     let mut queued: BinaryHeap<PrioritizedTileRequest> = BinaryHeap::new();
     let mut in_flight = HashSet::new();
-    let mut in_flight_tasks = tokio::task::JoinSet::new();
+    let mut in_flight_fetches = tokio::task::JoinSet::new();
     let mut shutting_down = false;
 
     loop {
-        while in_flight_tasks.len() < MAX_CONCURRENT_LOADS {
-            let Some(request) = queued.pop() else {
-                break;
-            };
+        while in_flight_fetches.len() < MAX_CONCURRENT_FETCHES {
+            let Some(request) = queued.pop() else { break };
             let request = request.0;
             if request.metadata.generation
                 != newest_generation(&queued, request.metadata.generation)
@@ -1009,26 +1115,18 @@ fn tile_loader_loop(
                 continue;
             }
             let source = source.clone();
-            in_flight_tasks.spawn(async move {
-                let tile = source
-                    .load_tile(request.id)
-                    .await
-                    .ok()
-                    .and_then(|bytes| image::load_from_memory(&bytes).ok())
-                    .map(|image| {
-                        let rgba = image.to_rgba8();
-                        let (width, height) = image.dimensions();
-                        LoadedTile {
-                            width,
-                            height,
-                            rgba: rgba.into_raw(),
-                        }
-                    });
-                (request.id, request.metadata, tile)
+            in_flight_fetches.spawn(async move {
+                let fetch_started = Instant::now();
+                let bytes = source.load_tile(request.id).await.ok();
+                FetchedTile {
+                    request,
+                    bytes,
+                    fetch_elapsed: fetch_started.elapsed(),
+                }
             });
         }
 
-        while let Ok(request) = receiver.recv_timeout(Duration::from_millis(5)) {
+        while let Ok(request) = receiver.recv_timeout(Duration::from_millis(2)) {
             match request {
                 TileLoaderRequest::Load(request) => {
                     if in_flight.insert(request.id) {
@@ -1040,17 +1138,44 @@ fn tile_loader_loop(
         }
 
         if let Ok(Some(join_result)) = runtime.block_on(async {
-            tokio::time::timeout(Duration::from_millis(5), in_flight_tasks.join_next()).await
+            tokio::time::timeout(Duration::from_millis(2), in_flight_fetches.join_next()).await
         }) {
-            if let Ok((id, metadata, tile)) = join_result {
-                in_flight.remove(&id);
-                let _ = commands.send(RenderCommand::TileLoaded { id, tile, metadata });
+            if let Ok(fetched) = join_result {
+                if decode_tx.send(fetched).is_err() {
+                    break;
+                }
             }
         }
 
-        if shutting_down && queued.is_empty() && in_flight_tasks.is_empty() {
+        loop {
+            match decoded_rx.try_recv() {
+                Ok(result) => {
+                    in_flight.remove(&result.id);
+                    let _ = commands.send(RenderCommand::TileLoaded {
+                        id: result.id,
+                        tile: result.tile,
+                        metadata: result.metadata,
+                        fetch_elapsed: result.fetch_elapsed,
+                        decode_elapsed: result.decode_elapsed,
+                    });
+                }
+                Err(TryRecvError::Empty) => break,
+                Err(TryRecvError::Disconnected) => break,
+            }
+        }
+
+        if shutting_down
+            && queued.is_empty()
+            && in_flight_fetches.is_empty()
+            && in_flight.is_empty()
+        {
             break;
         }
+    }
+
+    drop(decode_tx);
+    for handle in decode_threads {
+        let _ = handle.join();
     }
 }
 
