@@ -1,11 +1,13 @@
-use std::collections::{HashMap, HashSet};
+use std::cmp::Ordering;
+use std::collections::{BinaryHeap, HashMap, HashSet};
 use std::ffi::c_void;
 use std::path::PathBuf;
 use std::ptr::NonNull;
-use std::sync::mpsc::{self, Receiver, Sender};
 #[cfg(feature = "mobile")]
 use std::sync::Arc;
+use std::sync::mpsc::{self, Receiver, Sender};
 use std::thread::{self, JoinHandle};
+use std::time::{Duration, Instant};
 
 use image::GenericImageView;
 use jni::JNIEnv;
@@ -77,7 +79,8 @@ unsafe impl Send for NativeWindow {}
 
 impl NativeWindow {
     fn from_surface(env: &JNIEnv<'_>, surface: &JObject<'_>) -> Option<Self> {
-        let ptr = unsafe { ANativeWindow_fromSurface(env.get_native_interface(), surface.as_raw()) };
+        let ptr =
+            unsafe { ANativeWindow_fromSurface(env.get_native_interface(), surface.as_raw()) };
         NonNull::new(ptr).map(|ptr| Self { ptr })
     }
 
@@ -128,7 +131,13 @@ impl AndroidMapRenderer {
         let tile_loader_source = source.clone();
         let tile_loader = thread::Builder::new()
             .name("osm-map-tile-loader".to_owned())
-            .spawn(move || tile_loader_loop(tile_loader_source, tile_loader_commands, tile_request_receiver))
+            .spawn(move || {
+                tile_loader_loop(
+                    tile_loader_source,
+                    tile_loader_commands,
+                    tile_request_receiver,
+                )
+            })
             .map_err(|error| error.to_string())?;
         let worker_tile_requests = tile_requests.clone();
         let worker = thread::Builder::new()
@@ -169,7 +178,9 @@ impl Drop for AndroidMapRenderer {
 
 #[derive(Debug)]
 enum RenderCommand {
-    SurfaceCreated { window: NativeWindow },
+    SurfaceCreated {
+        window: NativeWindow,
+    },
     SurfaceDestroyed,
     Resize {
         width_px: u32,
@@ -195,13 +206,27 @@ enum RenderCommand {
     TileLoaded {
         id: TileId,
         tile: Option<LoadedTile>,
+        metadata: TileRequestMetadata,
     },
     Shutdown,
 }
 
 enum TileLoaderRequest {
-    Load(TileId),
+    Load(TileLoadRequest),
     Shutdown,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct TileRequestMetadata {
+    generation: u64,
+    requested_at: Instant,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct TileLoadRequest {
+    id: TileId,
+    metadata: TileRequestMetadata,
+    priority: f32,
 }
 
 #[derive(Debug, Clone)]
@@ -237,6 +262,10 @@ struct RendererWorker {
     surface_height_px: u32,
     loaded_tiles: HashMap<TileId, LoadedTile>,
     pending_tile_loads: HashSet<TileId>,
+    pending_metadata: HashMap<TileId, TileRequestMetadata>,
+    request_generation: u64,
+    last_camera_center: Option<(f64, f64)>,
+    camera_velocity_hint: (f32, f32),
     tile_requests: Sender<TileLoaderRequest>,
     gpu: Option<GpuSurface>,
 }
@@ -263,6 +292,10 @@ impl RendererWorker {
             surface_height_px: 0,
             loaded_tiles: HashMap::new(),
             pending_tile_loads: HashSet::new(),
+            pending_metadata: HashMap::new(),
+            request_generation: 0,
+            last_camera_center: None,
+            camera_velocity_hint: (0.0, 0.0),
             tile_requests,
             gpu: None,
         }
@@ -297,7 +330,9 @@ impl RendererWorker {
                     }
                 }
                 RenderCommand::SetCamera(camera) => {
+                    self.update_camera_velocity_hint(camera);
                     let _ = self.state.set_camera(camera);
+                    self.request_generation = self.request_generation.saturating_add(1);
                     self.render_frame();
                 }
                 RenderCommand::AddTileLayer {
@@ -334,12 +369,20 @@ impl RendererWorker {
                         self.render_frame();
                     }
                 }
-                RenderCommand::TileLoaded { id, tile } => {
+                RenderCommand::TileLoaded { id, tile, metadata } => {
+                    let is_current = self
+                        .pending_metadata
+                        .get(&id)
+                        .map(|current| current.generation == metadata.generation)
+                        .unwrap_or(false);
                     self.pending_tile_loads.remove(&id);
-                    if let Some(tile) = tile {
-                        self.loaded_tiles.insert(id, tile);
+                    self.pending_metadata.remove(&id);
+                    if is_current {
+                        if let Some(tile) = tile {
+                            self.loaded_tiles.insert(id, tile);
+                        }
+                        self.render_frame();
                     }
-                    self.render_frame();
                 }
                 RenderCommand::Shutdown => break,
             }
@@ -380,18 +423,27 @@ impl RendererWorker {
         }
     }
 
-    fn ensure_visible_tiles(
-        &mut self,
-        visible_tiles: &[osm_renderer::VisibleTile],
-    ) {
+    fn ensure_visible_tiles(&mut self, visible_tiles: &[osm_renderer::VisibleTile]) {
         for visible_tile in visible_tiles {
             let tile_id = visible_tile.id;
 
             if !self.loaded_tiles.contains_key(&tile_id)
                 && !self.pending_tile_loads.contains(&tile_id)
             {
+                let metadata = TileRequestMetadata {
+                    generation: self.request_generation,
+                    requested_at: Instant::now(),
+                };
+                let priority = self.tile_priority(visible_tile);
                 self.pending_tile_loads.insert(tile_id);
-                let _ = self.tile_requests.send(TileLoaderRequest::Load(tile_id));
+                self.pending_metadata.insert(tile_id, metadata);
+                let _ = self
+                    .tile_requests
+                    .send(TileLoaderRequest::Load(TileLoadRequest {
+                        id: tile_id,
+                        metadata,
+                        priority,
+                    }));
             }
 
             let tile_data = self.loaded_tiles.get(&tile_id).cloned();
@@ -410,6 +462,35 @@ impl RendererWorker {
                 && layer.common().opacity > 0.0
         })
     }
+
+    fn update_camera_velocity_hint(&mut self, camera: MapCamera) {
+        let current = (camera.center_lat, camera.center_lon);
+        if let Some(previous) = self.last_camera_center {
+            let dx = (current.1 - previous.1) as f32;
+            let dy = (current.0 - previous.0) as f32;
+            let magnitude = (dx * dx + dy * dy).sqrt();
+            self.camera_velocity_hint = if magnitude > 0.0 {
+                (dx / magnitude, dy / magnitude)
+            } else {
+                (0.0, 0.0)
+            };
+        }
+        self.last_camera_center = Some(current);
+    }
+
+    fn tile_priority(&self, visible_tile: &osm_renderer::VisibleTile) -> f32 {
+        let viewport_center_x = self.surface_width_px as f32 * 0.5;
+        let viewport_center_y = self.surface_height_px as f32 * 0.5;
+        let tile_center_x = visible_tile.screen_x_px + visible_tile.size_px * 0.5;
+        let tile_center_y = visible_tile.screen_y_px + visible_tile.size_px * 0.5;
+        let to_tile_x = tile_center_x - viewport_center_x;
+        let to_tile_y = tile_center_y - viewport_center_y;
+        let distance = (to_tile_x * to_tile_x + to_tile_y * to_tile_y).sqrt();
+        let direction_bonus = (to_tile_x * self.camera_velocity_hint.0
+            + to_tile_y * self.camera_velocity_hint.1)
+            / visible_tile.size_px.max(1.0);
+        -distance + direction_bonus * 32.0
+    }
 }
 
 fn tile_loader_loop(
@@ -417,16 +498,32 @@ fn tile_loader_loop(
     commands: Sender<RenderCommand>,
     receiver: Receiver<TileLoaderRequest>,
 ) {
+    const MAX_CONCURRENT_LOADS: usize = 8;
     let runtime = match tokio::runtime::Runtime::new() {
         Ok(runtime) => runtime,
         Err(_) => return,
     };
+    let mut queued = BinaryHeap::new();
+    let mut in_flight = HashSet::new();
+    let mut in_flight_tasks = tokio::task::JoinSet::new();
+    let mut shutting_down = false;
 
-    while let Ok(request) = receiver.recv() {
-        match request {
-            TileLoaderRequest::Load(tile_id) => {
-                let tile = runtime
-                    .block_on(source.load_tile(tile_id))
+    loop {
+        while in_flight_tasks.len() < MAX_CONCURRENT_LOADS {
+            let Some(request) = queued.pop() else {
+                break;
+            };
+            if request.metadata.generation
+                != newest_generation(&queued, request.metadata.generation)
+            {
+                in_flight.remove(&request.id);
+                continue;
+            }
+            let source = source.clone();
+            in_flight_tasks.spawn(async move {
+                let tile = source
+                    .load_tile(request.id)
+                    .await
                     .ok()
                     .and_then(|bytes| image::load_from_memory(&bytes).ok())
                     .map(|image| {
@@ -438,18 +535,77 @@ fn tile_loader_loop(
                             rgba: rgba.into_raw(),
                         }
                     });
-                let _ = commands.send(RenderCommand::TileLoaded { id: tile_id, tile });
+                (request.id, request.metadata, tile)
+            });
+        }
+
+        while let Ok(request) = receiver.recv_timeout(Duration::from_millis(5)) {
+            match request {
+                TileLoaderRequest::Load(request) => {
+                    if in_flight.insert(request.id) {
+                        queued.push(PrioritizedTileRequest(request));
+                    }
+                }
+                TileLoaderRequest::Shutdown => shutting_down = true,
             }
-            TileLoaderRequest::Shutdown => break,
+        }
+
+        if let Ok(Some(join_result)) = runtime.block_on(async {
+            tokio::time::timeout(Duration::from_millis(5), in_flight_tasks.join_next()).await
+        }) {
+            if let Ok((id, metadata, tile)) = join_result {
+                in_flight.remove(&id);
+                let _ = commands.send(RenderCommand::TileLoaded { id, tile, metadata });
+            }
+        }
+
+        if shutting_down && queued.is_empty() && in_flight_tasks.is_empty() {
+            break;
         }
     }
 }
 
+#[derive(Debug, Clone, Copy)]
+struct PrioritizedTileRequest(TileLoadRequest);
+
+impl PrioritizedTileRequest {
+    fn id(&self) -> TileId {
+        self.0.id
+    }
+}
+
+impl PartialEq for PrioritizedTileRequest {
+    fn eq(&self, other: &Self) -> bool {
+        self.0.id == other.0.id
+    }
+}
+
+impl Eq for PrioritizedTileRequest {}
+
+impl PartialOrd for PrioritizedTileRequest {
+    fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+impl Ord for PrioritizedTileRequest {
+    fn cmp(&self, other: &Self) -> Ordering {
+        self.0
+            .priority
+            .total_cmp(&other.0.priority)
+            .then_with(|| self.0.metadata.generation.cmp(&other.0.metadata.generation))
+    }
+}
+
+fn newest_generation(queue: &BinaryHeap<PrioritizedTileRequest>, fallback: u64) -> u64 {
+    queue
+        .peek()
+        .map(|entry| entry.0.metadata.generation)
+        .unwrap_or(fallback)
+}
+
 impl GpuSurface {
-    fn new(
-        native_window: NativeWindow,
-        runtime: &tokio::runtime::Runtime,
-    ) -> Result<Self, String> {
+    fn new(native_window: NativeWindow, runtime: &tokio::runtime::Runtime) -> Result<Self, String> {
         let instance = wgpu::Instance::default();
         let raw_window_handle =
             wgpu::rwh::AndroidNdkWindowHandle::new(native_window.raw_handle()).into();
@@ -694,7 +850,8 @@ impl GpuSurface {
                 let Some(tile_draw) = self.resolve_tile_draw(visible_tile.id) else {
                     continue;
                 };
-                let vertex_start = batch_vertices.len() as u64 * std::mem::size_of::<TexturedVertex>() as u64;
+                let vertex_start =
+                    batch_vertices.len() as u64 * std::mem::size_of::<TexturedVertex>() as u64;
                 let vertices = tile_vertices(
                     visible_tile.screen_x_px,
                     visible_tile.screen_y_px,
@@ -703,7 +860,9 @@ impl GpuSurface {
                     tile_draw.uv_right,
                     tile_draw.uv_top,
                     tile_draw.uv_bottom,
-                    self.config.as_ref().expect("surface configuration should exist"),
+                    self.config
+                        .as_ref()
+                        .expect("surface configuration should exist"),
                 );
                 batch_vertices.extend_from_slice(&vertices);
                 batch_draws.push((vertex_start, tile_draw.bind_group));
@@ -717,26 +876,27 @@ impl GpuSurface {
                             contents: bytes_of(&batch_vertices),
                             usage: wgpu::BufferUsages::VERTEX,
                         });
-            let mut render_pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
-                label: Some("osm-map-renderer-tile-pass"),
-                color_attachments: &[Some(wgpu::RenderPassColorAttachment {
-                    view: &view,
-                    resolve_target: None,
-                    ops: wgpu::Operations {
-                        load: wgpu::LoadOp::Load,
-                        store: wgpu::StoreOp::Store,
-                    },
-                    depth_slice: None,
-                })],
-                depth_stencil_attachment: None,
-                timestamp_writes: None,
-                occlusion_query_set: None,
-                multiview_mask: None,
-            });
-            render_pass.set_pipeline(&self.quad_pipeline);
+                let mut render_pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                    label: Some("osm-map-renderer-tile-pass"),
+                    color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                        view: &view,
+                        resolve_target: None,
+                        ops: wgpu::Operations {
+                            load: wgpu::LoadOp::Load,
+                            store: wgpu::StoreOp::Store,
+                        },
+                        depth_slice: None,
+                    })],
+                    depth_stencil_attachment: None,
+                    timestamp_writes: None,
+                    occlusion_query_set: None,
+                    multiview_mask: None,
+                });
+                render_pass.set_pipeline(&self.quad_pipeline);
 
                 for (vertex_start, bind_group) in batch_draws {
-                    let vertex_end = vertex_start + (6 * std::mem::size_of::<TexturedVertex>()) as u64;
+                    let vertex_end =
+                        vertex_start + (6 * std::mem::size_of::<TexturedVertex>()) as u64;
                     render_pass.set_bind_group(0, bind_group, &[]);
                     render_pass.set_vertex_buffer(0, vertex_buffer.slice(vertex_start..vertex_end));
                     render_pass.draw(0..6, 0..1);
@@ -840,12 +1000,7 @@ fn tile_vertices(
 }
 
 fn bytes_of<T>(slice: &[T]) -> &[u8] {
-    unsafe {
-        std::slice::from_raw_parts(
-            slice.as_ptr().cast::<u8>(),
-            std::mem::size_of_val(slice),
-        )
-    }
+    unsafe { std::slice::from_raw_parts(slice.as_ptr().cast::<u8>(), std::mem::size_of_val(slice)) }
 }
 
 fn renderer_from_ptr<'a>(ptr: jlong) -> Option<&'a AndroidMapRenderer> {
@@ -908,11 +1063,7 @@ fn native_create_renderer_from_engine(engine_handle: jlong) -> jlong {
     }
 }
 
-fn native_surface_created(
-    env: JNIEnv<'_>,
-    ptr: jlong,
-    surface: JObject<'_>,
-) {
+fn native_surface_created(env: JNIEnv<'_>, ptr: jlong, surface: JObject<'_>) {
     let Some(window) = NativeWindow::from_surface(&env, &surface) else {
         return;
     };
@@ -922,12 +1073,7 @@ fn native_surface_created(
     }
 }
 
-fn native_surface_changed(
-    ptr: jlong,
-    width_px: jint,
-    height_px: jint,
-    density: jfloat,
-) {
+fn native_surface_changed(ptr: jlong, width_px: jint, height_px: jint, density: jfloat) {
     if width_px <= 0 || height_px <= 0 {
         return;
     }
@@ -962,17 +1108,13 @@ fn native_set_camera(
     }
 }
 
-fn native_surface_destroyed(
-    ptr: jlong,
-) {
+fn native_surface_destroyed(ptr: jlong) {
     if let Some(renderer) = renderer_from_ptr(ptr) {
         renderer.send(RenderCommand::SurfaceDestroyed);
     }
 }
 
-fn native_destroy_renderer(
-    ptr: jlong,
-) {
+fn native_destroy_renderer(ptr: jlong) {
     take_renderer_from_ptr(ptr);
 }
 
@@ -1001,11 +1143,7 @@ fn native_add_tile_layer(
     }
 }
 
-fn native_remove_layer(
-    mut env: JNIEnv<'_>,
-    ptr: jlong,
-    layer_id: JString<'_>,
-) {
+fn native_remove_layer(mut env: JNIEnv<'_>, ptr: jlong, layer_id: JString<'_>) {
     let Some(layer_id) = java_string(&mut env, &layer_id) else {
         return;
     };
