@@ -65,6 +65,16 @@ impl FileTileCache {
         Ok(())
     }
 
+    pub async fn remove(&self, id: TileId) -> Result<(), TileError> {
+        let id = id.validate()?;
+
+        match fs::remove_file(self.tile_path(id)).await {
+            Ok(()) => Ok(()),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+            Err(error) => Err(TileError::CacheIo(error)),
+        }
+    }
+
     fn tile_path(&self, id: TileId) -> PathBuf {
         self.root
             .join(id.z.to_string())
@@ -109,6 +119,9 @@ mod tests {
 
         assert!(cache.contains(id).await.unwrap());
         assert_eq!(cache.get(id).await.unwrap(), Some(bytes.to_vec()));
+
+        cache.remove(id).await.unwrap();
+        assert!(!cache.contains(id).await.unwrap());
 
         let _ = fs::remove_dir_all(&root).await;
     }

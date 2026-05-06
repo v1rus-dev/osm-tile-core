@@ -1,6 +1,10 @@
 use async_trait::async_trait;
+use reqwest::header::{ACCEPT, HeaderValue};
 
 use crate::{FileTileCache, TileError, TileId};
+
+const TILE_USER_AGENT: &str = "osm-tile-engine/0.1";
+const TILE_ACCEPT_HEADER: &str = "image/webp,image/png,image/jpeg,*/*;q=0.8";
 
 #[async_trait]
 pub trait TileSource: Send + Sync {
@@ -26,7 +30,9 @@ impl HttpTileSource {
 
         Ok(Self {
             url_template,
-            client: reqwest::Client::new(),
+            client: reqwest::Client::builder()
+                .user_agent(TILE_USER_AGENT)
+                .build()?,
         })
     }
 
@@ -46,7 +52,12 @@ impl HttpTileSource {
 impl TileSource for HttpTileSource {
     async fn load_tile(&self, id: TileId) -> Result<Vec<u8>, TileError> {
         let id = id.validate()?;
-        let response = self.client.get(self.tile_url(id)).send().await?;
+        let response = self
+            .client
+            .get(self.tile_url(id))
+            .header(ACCEPT, HeaderValue::from_static(TILE_ACCEPT_HEADER))
+            .send()
+            .await?;
         let status = response.status();
 
         if !status.is_success() {

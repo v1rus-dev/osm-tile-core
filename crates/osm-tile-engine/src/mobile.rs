@@ -137,6 +137,10 @@ impl OsmTileEngine {
         tile_url_template: String,
         cache_dir: String,
     ) -> Result<Arc<Self>, OsmTileEngineError> {
+        eprintln!(
+            "OsmTileEngine: creating engine url_template={} cache_dir={}",
+            tile_url_template, cache_dir
+        );
         let http_source = HttpTileSource::new(tile_url_template)?;
         let cache = FileTileCache::new(PathBuf::from(cache_dir));
         let source = CachedTileSource::new(http_source, cache);
@@ -164,9 +168,25 @@ impl OsmTileEngine {
             i64_to_u32(y, "y")?,
         )?;
 
-        self.runtime
+        eprintln!("OsmTileEngine: loading tile z={} x={} y={}", z, x, y);
+        let loaded = self
+            .runtime
             .block_on(self.source.load_tile(tile_id))
-            .map_err(OsmTileEngineError::from)
+            .map_err(OsmTileEngineError::from);
+        match &loaded {
+            Ok(bytes) => eprintln!(
+                "OsmTileEngine: loaded tile z={} x={} y={} bytes={}",
+                z,
+                x,
+                y,
+                bytes.len()
+            ),
+            Err(error) => eprintln!(
+                "OsmTileEngine: failed to load tile z={} x={} y={}: {}",
+                z, x, y, error
+            ),
+        }
+        loaded
     }
 
     /// Updates the current map viewport used by `visibleMarkers` and `clusteredMarkers`.
