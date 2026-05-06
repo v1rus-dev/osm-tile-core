@@ -3,8 +3,17 @@ name = "osm-tile-core"
 version = "0.1.0"
 edition = "2024"
 
+[lib]
+crate-type = ["lib", "cdylib", "staticlib"]
+
+[features]
+default = []
+mobile = ["dep:uniffi", "uniffi/tokio"]
+uniffi-cli = ["dep:uniffi", "uniffi/cli"]
+
 [dependencies]
 async-trait = "0.1"
 reqwest = { version = "0.12", default-features = false, features = ["rustls-tls"] }
 thiserror = "2"
 tokio = { version = "1", features = ["fs", "io-util", "macros", "net", "rt-multi-thread"] }
+uniffi = { version = "0.31.1", optional = true }

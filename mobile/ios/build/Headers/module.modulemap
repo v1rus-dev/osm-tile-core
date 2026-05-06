@@ -1,0 +1,7 @@
+framework module osm_tile_core {
+    header "OsmTileCoreFFI.h"
+    export *
+    use "Darwin"
+    use "_Builtin_stdbool"
+    use "_Builtin_stdint"
+}
