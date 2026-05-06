@@ -8,13 +8,13 @@ fi
 
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 IOS_DIR="$ROOT_DIR/mobile/ios"
-SWIFT_OUT="$IOS_DIR/Sources/OsmTileCore"
+SWIFT_OUT="$IOS_DIR/Sources/OsmTileEngine"
 HEADERS_OUT="$IOS_DIR/build/Headers"
-XCFRAMEWORK_OUT="$IOS_DIR/OsmTileCore.xcframework"
+XCFRAMEWORK_OUT="$IOS_DIR/OsmTileEngine.xcframework"
 DEVICE_TARGET="aarch64-apple-ios"
 SIM_TARGET="aarch64-apple-ios-sim"
-DEVICE_LIB="$ROOT_DIR/target/$DEVICE_TARGET/release/libosm_tile_core.a"
-SIM_LIB="$ROOT_DIR/target/$SIM_TARGET/release/libosm_tile_core.a"
+DEVICE_LIB="$ROOT_DIR/target/$DEVICE_TARGET/release/libosm_tile_engine.a"
+SIM_LIB="$ROOT_DIR/target/$SIM_TARGET/release/libosm_tile_engine.a"
 
 command -v cargo >/dev/null || {
   echo "cargo is required" >&2
@@ -28,19 +28,19 @@ command -v xcodebuild >/dev/null || {
 
 rustup target add "$DEVICE_TARGET" "$SIM_TARGET"
 
-cargo build --release --features mobile --target "$DEVICE_TARGET"
-cargo build --release --features mobile --target "$SIM_TARGET"
+cargo build -p osm-tile-engine --release --features mobile --target "$DEVICE_TARGET"
+cargo build -p osm-tile-engine --release --features mobile --target "$SIM_TARGET"
 
 rm -rf "$SWIFT_OUT" "$HEADERS_OUT" "$XCFRAMEWORK_OUT"
 mkdir -p "$SWIFT_OUT" "$HEADERS_OUT"
 
-cargo run --features uniffi-cli --bin uniffi-bindgen-swift -- \
+cargo run -p osm-tile-engine --features uniffi-cli --bin uniffi-bindgen-swift -- \
   "$DEVICE_LIB" "$SWIFT_OUT" --swift-sources
 
-cargo run --features uniffi-cli --bin uniffi-bindgen-swift -- \
+cargo run -p osm-tile-engine --features uniffi-cli --bin uniffi-bindgen-swift -- \
   "$DEVICE_LIB" "$HEADERS_OUT" --headers
 
-cargo run --features uniffi-cli --bin uniffi-bindgen-swift -- \
+cargo run -p osm-tile-engine --features uniffi-cli --bin uniffi-bindgen-swift -- \
   "$DEVICE_LIB" "$HEADERS_OUT" --xcframework --modulemap --modulemap-filename module.modulemap
 
 xcodebuild -create-xcframework \

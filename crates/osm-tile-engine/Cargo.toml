@@ -1,0 +1,21 @@
+[package]
+name = "osm-tile-engine"
+version.workspace = true
+edition.workspace = true
+
+[lib]
+name = "osm_tile_engine"
+crate-type = ["lib", "cdylib", "staticlib"]
+
+[features]
+default = []
+mobile = ["dep:uniffi", "uniffi/tokio"]
+uniffi-cli = ["dep:uniffi", "uniffi/cli"]
+
+[dependencies]
+osm-core.workspace = true
+osm-loader.workspace = true
+osm-renderer.workspace = true
+thiserror.workspace = true
+tokio.workspace = true
+uniffi = { workspace = true, optional = true }

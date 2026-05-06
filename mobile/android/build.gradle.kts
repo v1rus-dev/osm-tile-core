@@ -2,8 +2,12 @@ plugins {
     id("com.android.library")
 }
 
+if (extensions.findByName("kotlin") == null) {
+    apply(plugin = "org.jetbrains.kotlin.android")
+}
+
 android {
-    namespace = "com.osmtilecore"
+    namespace = "yegor.cheprasov.osmtileengine"
     compileSdk = 35
 
     defaultConfig {
@@ -12,7 +16,7 @@ android {
 
     sourceSets {
         getByName("main") {
-            java.srcDir("src/main/java")
+            java.srcDirs("src/main/java", "src/main/kotlin")
             jniLibs.srcDir("src/main/jniLibs")
         }
     }

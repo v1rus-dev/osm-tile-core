@@ -7,8 +7,8 @@ import Foundation
 // Depending on the consumer's build setup, the low-level FFI code
 // might be in a separate module, or it might be compiled inline into
 // this module. This is a bit of light hackery to work with both.
-#if canImport(OsmTileCoreFFI)
-import OsmTileCoreFFI
+#if canImport(OsmTileEngineFFI)
+import OsmTileEngineFFI
 #endif
 
 fileprivate extension RustBuffer {
@@ -25,13 +25,13 @@ fileprivate extension RustBuffer {
     }
 
     static func from(_ ptr: UnsafeBufferPointer<UInt8>) -> RustBuffer {
-        try! rustCall { ffi_osm_tile_core_rustbuffer_from_bytes(ForeignBytes(bufferPointer: ptr), $0) }
+        try! rustCall { ffi_osm_tile_engine_rustbuffer_from_bytes(ForeignBytes(bufferPointer: ptr), $0) }
     }
 
     // Frees the buffer in place.
     // The buffer must not be used after this is called.
     func deallocate() {
-        try! rustCall { ffi_osm_tile_core_rustbuffer_free(self, $0) }
+        try! rustCall { ffi_osm_tile_engine_rustbuffer_free(self, $0) }
     }
 }
 
@@ -281,7 +281,7 @@ private func makeRustCall<T, E: Swift.Error>(
     _ callback: (UnsafeMutablePointer<RustCallStatus>) -> T,
     errorHandler: ((RustBuffer) throws -> E)?
 ) throws -> T {
-    uniffiEnsureOsmTileCoreInitialized()
+    uniffiEnsureOsmTileEngineInitialized()
     var callStatus = RustCallStatus.init()
     let returnedVal = callback(&callStatus)
     try uniffiCheckCallStatus(callStatus: callStatus, errorHandler: errorHandler)
@@ -519,7 +519,7 @@ fileprivate struct FfiConverterData: FfiConverterRustBuffer {
  * background thread, coroutine dispatcher, or Swift task instead of the UI
  * thread.
  */
-public protocol OsmTileCoreProtocol: AnyObject, Sendable {
+public protocol OsmTileEngineProtocol: AnyObject, Sendable {
     
     /**
      * Clears all markers from the Rust marker store.
@@ -595,7 +595,7 @@ public protocol OsmTileCoreProtocol: AnyObject, Sendable {
  * background thread, coroutine dispatcher, or Swift task instead of the UI
  * thread.
  */
-open class OsmTileCore: OsmTileCoreProtocol, @unchecked Sendable {
+open class OsmTileEngine: OsmTileEngineProtocol, @unchecked Sendable {
     fileprivate let handle: UInt64
 
     /// Used to instantiate a [FFIObject] without an actual handle, for fakes in tests, mostly.
@@ -632,7 +632,7 @@ open class OsmTileCore: OsmTileCoreProtocol, @unchecked Sendable {
     @_documentation(visibility: private)
 #endif
     public func uniffiCloneHandle() -> UInt64 {
-        return try! rustCall { uniffi_osm_tile_core_fn_clone_osmtilecore(self.handle, $0) }
+        return try! rustCall { uniffi_osm_tile_engine_fn_clone_osmtileengine(self.handle, $0) }
     }
     /**
      * Creates a tile engine with cache-first behavior.
@@ -643,8 +643,8 @@ open class OsmTileCore: OsmTileCoreProtocol, @unchecked Sendable {
      */
 public convenience init(tileUrlTemplate: String, cacheDir: String)throws  {
     let handle =
-        try rustCallWithError(FfiConverterTypeOsmTileCoreError_lift) {
-    uniffi_osm_tile_core_fn_constructor_osmtilecore_new(
+        try rustCallWithError(FfiConverterTypeOsmTileEngineError_lift) {
+    uniffi_osm_tile_engine_fn_constructor_osmtileengine_new(
         FfiConverterString.lower(tileUrlTemplate),
         FfiConverterString.lower(cacheDir),$0
     )
@@ -658,7 +658,7 @@ public convenience init(tileUrlTemplate: String, cacheDir: String)throws  {
             return
         }
 
-        try! rustCall { uniffi_osm_tile_core_fn_free_osmtilecore(handle, $0) }
+        try! rustCall { uniffi_osm_tile_engine_fn_free_osmtileengine(handle, $0) }
     }
 
     
@@ -667,8 +667,8 @@ public convenience init(tileUrlTemplate: String, cacheDir: String)throws  {
     /**
      * Clears all markers from the Rust marker store.
      */
-open func clearMarkers()throws   {try rustCallWithError(FfiConverterTypeOsmTileCoreError_lift) {
-    uniffi_osm_tile_core_fn_method_osmtilecore_clear_markers(
+open func clearMarkers()throws   {try rustCallWithError(FfiConverterTypeOsmTileEngineError_lift) {
+    uniffi_osm_tile_engine_fn_method_osmtileengine_clear_markers(
             self.uniffiCloneHandle(),$0
     )
 }
@@ -681,8 +681,8 @@ open func clearMarkers()throws   {try rustCallWithError(FfiConverterTypeOsmTileC
      * visibility range.
      */
 open func clusteredAll(zoom: Int64)throws  -> [MobileMarkerRenderItem]  {
-    return try  FfiConverterSequenceTypeMobileMarkerRenderItem.lift(try rustCallWithError(FfiConverterTypeOsmTileCoreError_lift) {
-    uniffi_osm_tile_core_fn_method_osmtilecore_clustered_all(
+    return try  FfiConverterSequenceTypeMobileMarkerRenderItem.lift(try rustCallWithError(FfiConverterTypeOsmTileEngineError_lift) {
+    uniffi_osm_tile_engine_fn_method_osmtileengine_clustered_all(
             self.uniffiCloneHandle(),
         FfiConverterInt64.lower(zoom),$0
     )
@@ -696,8 +696,8 @@ open func clusteredAll(zoom: Int64)throws  -> [MobileMarkerRenderItem]  {
      * The UI should render markers and clusters using its own icons and views.
      */
 open func clusteredMarkers()throws  -> [MobileMarkerRenderItem]  {
-    return try  FfiConverterSequenceTypeMobileMarkerRenderItem.lift(try rustCallWithError(FfiConverterTypeOsmTileCoreError_lift) {
-    uniffi_osm_tile_core_fn_method_osmtilecore_clustered_markers(
+    return try  FfiConverterSequenceTypeMobileMarkerRenderItem.lift(try rustCallWithError(FfiConverterTypeOsmTileEngineError_lift) {
+    uniffi_osm_tile_engine_fn_method_osmtileengine_clustered_markers(
             self.uniffiCloneHandle(),$0
     )
 })
@@ -711,8 +711,8 @@ open func clusteredMarkers()throws  -> [MobileMarkerRenderItem]  {
      * and returns the image bytes. Do not call this from the UI thread.
      */
 open func loadTile(z: Int64, x: Int64, y: Int64)throws  -> Data  {
-    return try  FfiConverterData.lift(try rustCallWithError(FfiConverterTypeOsmTileCoreError_lift) {
-    uniffi_osm_tile_core_fn_method_osmtilecore_load_tile(
+    return try  FfiConverterData.lift(try rustCallWithError(FfiConverterTypeOsmTileEngineError_lift) {
+    uniffi_osm_tile_engine_fn_method_osmtileengine_load_tile(
             self.uniffiCloneHandle(),
         FfiConverterInt64.lower(z),
         FfiConverterInt64.lower(x),
@@ -724,8 +724,8 @@ open func loadTile(z: Int64, x: Int64, y: Int64)throws  -> Data  {
     /**
      * Removes one marker from the Rust marker store.
      */
-open func removeMarker(id: Int64)throws   {try rustCallWithError(FfiConverterTypeOsmTileCoreError_lift) {
-    uniffi_osm_tile_core_fn_method_osmtilecore_remove_marker(
+open func removeMarker(id: Int64)throws   {try rustCallWithError(FfiConverterTypeOsmTileEngineError_lift) {
+    uniffi_osm_tile_engine_fn_method_osmtileengine_remove_marker(
             self.uniffiCloneHandle(),
         FfiConverterInt64.lower(id),$0
     )
@@ -738,8 +738,8 @@ open func removeMarker(id: Int64)throws   {try rustCallWithError(FfiConverterTyp
      * Use this when the app has a complete offline marker set or wants to reset
      * the working set after a new server query.
      */
-open func replaceMarkers(markers: [MobileMarker])throws   {try rustCallWithError(FfiConverterTypeOsmTileCoreError_lift) {
-    uniffi_osm_tile_core_fn_method_osmtilecore_replace_markers(
+open func replaceMarkers(markers: [MobileMarker])throws   {try rustCallWithError(FfiConverterTypeOsmTileEngineError_lift) {
+    uniffi_osm_tile_engine_fn_method_osmtileengine_replace_markers(
             self.uniffiCloneHandle(),
         FfiConverterSequenceTypeMobileMarker.lower(markers),$0
     )
@@ -749,8 +749,8 @@ open func replaceMarkers(markers: [MobileMarker])throws   {try rustCallWithError
     /**
      * Updates the current map viewport used by `visibleMarkers` and `clusteredMarkers`.
      */
-open func setViewport(viewport: MobileViewport)throws   {try rustCallWithError(FfiConverterTypeOsmTileCoreError_lift) {
-    uniffi_osm_tile_core_fn_method_osmtilecore_set_viewport(
+open func setViewport(viewport: MobileViewport)throws   {try rustCallWithError(FfiConverterTypeOsmTileEngineError_lift) {
+    uniffi_osm_tile_engine_fn_method_osmtileengine_set_viewport(
             self.uniffiCloneHandle(),
         FfiConverterTypeMobileViewport_lower(viewport),$0
     )
@@ -763,8 +763,8 @@ open func setViewport(viewport: MobileViewport)throws   {try rustCallWithError(F
      * This is useful when the app loads markers page-by-page or bbox-by-bbox
      * from a backend. If the same id appears more than once, the last marker wins.
      */
-open func upsertMarkers(markers: [MobileMarker])throws   {try rustCallWithError(FfiConverterTypeOsmTileCoreError_lift) {
-    uniffi_osm_tile_core_fn_method_osmtilecore_upsert_markers(
+open func upsertMarkers(markers: [MobileMarker])throws   {try rustCallWithError(FfiConverterTypeOsmTileEngineError_lift) {
+    uniffi_osm_tile_engine_fn_method_osmtileengine_upsert_markers(
             self.uniffiCloneHandle(),
         FfiConverterSequenceTypeMobileMarker.lower(markers),$0
     )
@@ -778,8 +778,8 @@ open func upsertMarkers(markers: [MobileMarker])throws   {try rustCallWithError(
      * for stable rendering.
      */
 open func visibleMarkers()throws  -> [MobileMarker]  {
-    return try  FfiConverterSequenceTypeMobileMarker.lift(try rustCallWithError(FfiConverterTypeOsmTileCoreError_lift) {
-    uniffi_osm_tile_core_fn_method_osmtilecore_visible_markers(
+    return try  FfiConverterSequenceTypeMobileMarker.lift(try rustCallWithError(FfiConverterTypeOsmTileEngineError_lift) {
+    uniffi_osm_tile_engine_fn_method_osmtileengine_visible_markers(
             self.uniffiCloneHandle(),$0
     )
 })
@@ -793,24 +793,24 @@ open func visibleMarkers()throws  -> [MobileMarker]  {
 #if swift(>=5.8)
 @_documentation(visibility: private)
 #endif
-public struct FfiConverterTypeOsmTileCore: FfiConverter {
+public struct FfiConverterTypeOsmTileEngine: FfiConverter {
     typealias FfiType = UInt64
-    typealias SwiftType = OsmTileCore
+    typealias SwiftType = OsmTileEngine
 
-    public static func lift(_ handle: UInt64) throws -> OsmTileCore {
-        return OsmTileCore(unsafeFromHandle: handle)
+    public static func lift(_ handle: UInt64) throws -> OsmTileEngine {
+        return OsmTileEngine(unsafeFromHandle: handle)
     }
 
-    public static func lower(_ value: OsmTileCore) -> UInt64 {
+    public static func lower(_ value: OsmTileEngine) -> UInt64 {
         return value.uniffiCloneHandle()
     }
 
-    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> OsmTileCore {
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> OsmTileEngine {
         let handle: UInt64 = try readInt(&buf)
         return try lift(handle)
     }
 
-    public static func write(_ value: OsmTileCore, into buf: inout [UInt8]) {
+    public static func write(_ value: OsmTileEngine, into buf: inout [UInt8]) {
         writeInt(&buf, lower(value))
     }
 }
@@ -819,15 +819,15 @@ public struct FfiConverterTypeOsmTileCore: FfiConverter {
 #if swift(>=5.8)
 @_documentation(visibility: private)
 #endif
-public func FfiConverterTypeOsmTileCore_lift(_ handle: UInt64) throws -> OsmTileCore {
-    return try FfiConverterTypeOsmTileCore.lift(handle)
+public func FfiConverterTypeOsmTileEngine_lift(_ handle: UInt64) throws -> OsmTileEngine {
+    return try FfiConverterTypeOsmTileEngine.lift(handle)
 }
 
 #if swift(>=5.8)
 @_documentation(visibility: private)
 #endif
-public func FfiConverterTypeOsmTileCore_lower(_ value: OsmTileCore) -> UInt64 {
-    return FfiConverterTypeOsmTileCore.lower(value)
+public func FfiConverterTypeOsmTileEngine_lower(_ value: OsmTileEngine) -> UInt64 {
+    return FfiConverterTypeOsmTileEngine.lower(value)
 }
 
 
@@ -1317,7 +1317,7 @@ public func FfiConverterTypeMobileRenderItemType_lower(_ value: MobileRenderItem
  *
  * The `details` field is safe to display in logs and developer diagnostics.
  */
-public enum OsmTileCoreError: Swift.Error, Equatable, Hashable, Codable, Foundation.LocalizedError {
+public enum OsmTileEngineError: Swift.Error, Equatable, Hashable, Codable, Foundation.LocalizedError {
 
     
     
@@ -1354,16 +1354,16 @@ public enum OsmTileCoreError: Swift.Error, Equatable, Hashable, Codable, Foundat
 }
 
 #if compiler(>=6)
-extension OsmTileCoreError: Sendable {}
+extension OsmTileEngineError: Sendable {}
 #endif
 
 #if swift(>=5.8)
 @_documentation(visibility: private)
 #endif
-public struct FfiConverterTypeOsmTileCoreError: FfiConverterRustBuffer {
-    typealias SwiftType = OsmTileCoreError
+public struct FfiConverterTypeOsmTileEngineError: FfiConverterRustBuffer {
+    typealias SwiftType = OsmTileEngineError
 
-    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> OsmTileCoreError {
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> OsmTileEngineError {
         let variant: Int32 = try readInt(&buf)
         switch variant {
 
@@ -1387,7 +1387,7 @@ public struct FfiConverterTypeOsmTileCoreError: FfiConverterRustBuffer {
         }
     }
 
-    public static func write(_ value: OsmTileCoreError, into buf: inout [UInt8]) {
+    public static func write(_ value: OsmTileEngineError, into buf: inout [UInt8]) {
         switch value {
 
         
@@ -1421,15 +1421,15 @@ public struct FfiConverterTypeOsmTileCoreError: FfiConverterRustBuffer {
 #if swift(>=5.8)
 @_documentation(visibility: private)
 #endif
-public func FfiConverterTypeOsmTileCoreError_lift(_ buf: RustBuffer) throws -> OsmTileCoreError {
-    return try FfiConverterTypeOsmTileCoreError.lift(buf)
+public func FfiConverterTypeOsmTileEngineError_lift(_ buf: RustBuffer) throws -> OsmTileEngineError {
+    return try FfiConverterTypeOsmTileEngineError.lift(buf)
 }
 
 #if swift(>=5.8)
 @_documentation(visibility: private)
 #endif
-public func FfiConverterTypeOsmTileCoreError_lower(_ value: OsmTileCoreError) -> RustBuffer {
-    return FfiConverterTypeOsmTileCoreError.lower(value)
+public func FfiConverterTypeOsmTileEngineError_lower(_ value: OsmTileEngineError) -> RustBuffer {
+    return FfiConverterTypeOsmTileEngineError.lower(value)
 }
 
 #if swift(>=5.8)
@@ -1566,38 +1566,38 @@ private let initializationResult: InitializationResult = {
     // Get the bindings contract version from our ComponentInterface
     let bindings_contract_version = 30
     // Get the scaffolding contract version by calling the into the dylib
-    let scaffolding_contract_version = ffi_osm_tile_core_uniffi_contract_version()
+    let scaffolding_contract_version = ffi_osm_tile_engine_uniffi_contract_version()
     if bindings_contract_version != scaffolding_contract_version {
         return InitializationResult.contractVersionMismatch
     }
-    if (uniffi_osm_tile_core_checksum_method_osmtilecore_clear_markers() != 41979) {
+    if (uniffi_osm_tile_engine_checksum_method_osmtileengine_clear_markers() != 57017) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_osm_tile_core_checksum_method_osmtilecore_clustered_all() != 62518) {
+    if (uniffi_osm_tile_engine_checksum_method_osmtileengine_clustered_all() != 33209) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_osm_tile_core_checksum_method_osmtilecore_clustered_markers() != 14318) {
+    if (uniffi_osm_tile_engine_checksum_method_osmtileengine_clustered_markers() != 748) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_osm_tile_core_checksum_method_osmtilecore_load_tile() != 53716) {
+    if (uniffi_osm_tile_engine_checksum_method_osmtileengine_load_tile() != 29026) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_osm_tile_core_checksum_method_osmtilecore_remove_marker() != 42478) {
+    if (uniffi_osm_tile_engine_checksum_method_osmtileengine_remove_marker() != 29642) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_osm_tile_core_checksum_method_osmtilecore_replace_markers() != 52436) {
+    if (uniffi_osm_tile_engine_checksum_method_osmtileengine_replace_markers() != 29716) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_osm_tile_core_checksum_method_osmtilecore_set_viewport() != 4635) {
+    if (uniffi_osm_tile_engine_checksum_method_osmtileengine_set_viewport() != 43979) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_osm_tile_core_checksum_method_osmtilecore_upsert_markers() != 38029) {
+    if (uniffi_osm_tile_engine_checksum_method_osmtileengine_upsert_markers() != 52393) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_osm_tile_core_checksum_method_osmtilecore_visible_markers() != 61696) {
+    if (uniffi_osm_tile_engine_checksum_method_osmtileengine_visible_markers() != 22906) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_osm_tile_core_checksum_constructor_osmtilecore_new() != 51926) {
+    if (uniffi_osm_tile_engine_checksum_constructor_osmtileengine_new() != 31881) {
         return InitializationResult.apiChecksumMismatch
     }
 
@@ -1606,7 +1606,7 @@ private let initializationResult: InitializationResult = {
 
 // Make the ensure init function public so that other modules which have external type references to
 // our types can call it.
-public func uniffiEnsureOsmTileCoreInitialized() {
+public func uniffiEnsureOsmTileEngineInitialized() {
     switch initializationResult {
     case .ok:
         break

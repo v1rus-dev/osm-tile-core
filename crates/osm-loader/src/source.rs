@@ -117,7 +117,7 @@ mod tests {
     }
 
     fn temp_cache_dir(name: &str) -> PathBuf {
-        std::env::temp_dir().join(format!("osm-tile-core-{}-{}", name, std::process::id()))
+        std::env::temp_dir().join(format!("osm-tile-engine-{}-{}", name, std::process::id()))
     }
 
     #[test]

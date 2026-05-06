@@ -3,7 +3,7 @@
 
 @file:Suppress("NAME_SHADOWING")
 
-package com.osmtilecore
+package yegor.cheprasov.osmtileengine
 
 // Common helper code.
 //
@@ -17,22 +17,22 @@ package com.osmtilecore
 // compile the Rust component. The easiest way to ensure this is to bundle the Kotlin
 // helpers directly inline like we're doing here.
 
-import com.sun.jna.Library
+import android.os.Build
+import androidx.annotation.RequiresApi
+import com.sun.jna.Callback
 import com.sun.jna.IntegerType
+import com.sun.jna.Library
 import com.sun.jna.Native
 import com.sun.jna.Pointer
 import com.sun.jna.Structure
-import com.sun.jna.Callback
 import com.sun.jna.ptr.*
 import java.nio.ByteBuffer
 import java.nio.ByteOrder
 import java.nio.CharBuffer
 import java.nio.charset.CodingErrorAction
-import java.util.concurrent.atomic.AtomicLong
 import java.util.concurrent.ConcurrentHashMap
-import android.os.Build
-import androidx.annotation.RequiresApi
 import java.util.concurrent.atomic.AtomicBoolean
+import java.util.concurrent.atomic.AtomicLong
 
 // This is a helper for safely working with byte buffers returned from the Rust code.
 // A rust-owned buffer is represented by its capacity, its current length, and a
@@ -46,29 +46,41 @@ open class RustBuffer : Structure() {
     // Note: `capacity` and `len` are actually `ULong` values, but JVM only supports signed values.
     // When dealing with these fields, make sure to call `toULong()`.
     @JvmField var capacity: Long = 0
+
     @JvmField var len: Long = 0
+
     @JvmField var data: Pointer? = null
 
-    class ByValue: RustBuffer(), Structure.ByValue
-    class ByReference: RustBuffer(), Structure.ByReference
+    class ByValue :
+        RustBuffer(),
+        Structure.ByValue
 
-   internal fun setValue(other: RustBuffer) {
+    class ByReference :
+        RustBuffer(),
+        Structure.ByReference
+
+    internal fun setValue(other: RustBuffer) {
         capacity = other.capacity
         len = other.len
         data = other.data
     }
 
     companion object {
-        internal fun alloc(size: ULong = 0UL) = uniffiRustCall() { status ->
-            // Note: need to convert the size to a `Long` value to make this work with JVM.
-            UniffiLib.ffi_osm_tile_core_rustbuffer_alloc(size.toLong(), status)
-        }.also {
-            if(it.data == null) {
-               throw RuntimeException("RustBuffer.alloc() returned null data pointer (size=${size})")
-           }
-        }
+        internal fun alloc(size: ULong = 0UL) =
+            uniffiRustCall { status ->
+                // Note: need to convert the size to a `Long` value to make this work with JVM.
+                UniffiLib.ffi_osm_tile_engine_rustbuffer_alloc(size.toLong(), status)
+            }.also {
+                if (it.data == null) {
+                    throw RuntimeException("RustBuffer.alloc() returned null data pointer (size=$size)")
+                }
+            }
 
-        internal fun create(capacity: ULong, len: ULong, data: Pointer?): RustBuffer.ByValue {
+        internal fun create(
+            capacity: ULong,
+            len: ULong,
+            data: Pointer?,
+        ): RustBuffer.ByValue {
             var buf = RustBuffer.ByValue()
             buf.capacity = capacity.toLong()
             buf.len = len.toLong()
@@ -76,9 +88,10 @@ open class RustBuffer : Structure() {
             return buf
         }
 
-        internal fun free(buf: RustBuffer.ByValue) = uniffiRustCall() { status ->
-            UniffiLib.ffi_osm_tile_core_rustbuffer_free(buf, status)
-        }
+        internal fun free(buf: RustBuffer.ByValue) =
+            uniffiRustCall { status ->
+                UniffiLib.ffi_osm_tile_engine_rustbuffer_free(buf, status)
+            }
     }
 
     @Suppress("TooGenericExceptionThrown")
@@ -97,10 +110,14 @@ open class RustBuffer : Structure() {
 @Structure.FieldOrder("len", "data")
 internal open class ForeignBytes : Structure() {
     @JvmField var len: Int = 0
+
     @JvmField var data: Pointer? = null
 
-    class ByValue : ForeignBytes(), Structure.ByValue
+    class ByValue :
+        ForeignBytes(),
+        Structure.ByValue
 }
+
 /**
  * The FfiConverter interface handles converter types to and from the FFI
  *
@@ -130,7 +147,10 @@ public interface FfiConverter<KotlinType, FfiType> {
     fun allocationSize(value: KotlinType): ULong
 
     // Write a Kotlin type to a `ByteBuffer`
-    fun write(value: KotlinType, buf: ByteBuffer)
+    fun write(
+        value: KotlinType,
+        buf: ByteBuffer,
+    )
 
     // Lower a value into a `RustBuffer`
     //
@@ -141,9 +161,10 @@ public interface FfiConverter<KotlinType, FfiType> {
     fun lowerIntoRustBuffer(value: KotlinType): RustBuffer.ByValue {
         val rbuf = RustBuffer.alloc(allocationSize(value))
         try {
-            val bbuf = rbuf.data!!.getByteBuffer(0, rbuf.capacity).also {
-                it.order(ByteOrder.BIG_ENDIAN)
-            }
+            val bbuf =
+                rbuf.data!!.getByteBuffer(0, rbuf.capacity).also {
+                    it.order(ByteOrder.BIG_ENDIAN)
+                }
             write(value, bbuf)
             rbuf.writeField("len", bbuf.position().toLong())
             return rbuf
@@ -160,11 +181,11 @@ public interface FfiConverter<KotlinType, FfiType> {
     fun liftFromRustBuffer(rbuf: RustBuffer.ByValue): KotlinType {
         val byteBuf = rbuf.asByteBuffer()!!
         try {
-           val item = read(byteBuf)
-           if (byteBuf.hasRemaining()) {
-               throw RuntimeException("junk remaining in buffer after lifting, something is very wrong!!")
-           }
-           return item
+            val item = read(byteBuf)
+            if (byteBuf.hasRemaining()) {
+                throw RuntimeException("junk remaining in buffer after lifting, something is very wrong!!")
+            }
+            return item
         } finally {
             RustBuffer.free(rbuf)
         }
@@ -176,8 +197,9 @@ public interface FfiConverter<KotlinType, FfiType> {
  *
  * @suppress
  */
-public interface FfiConverterRustBuffer<KotlinType>: FfiConverter<KotlinType, RustBuffer.ByValue> {
+public interface FfiConverterRustBuffer<KotlinType> : FfiConverter<KotlinType, RustBuffer.ByValue> {
     override fun lift(value: RustBuffer.ByValue) = liftFromRustBuffer(value)
+
     override fun lower(value: KotlinType) = lowerIntoRustBuffer(value)
 }
 // A handful of classes and functions to support the generated data structures.
@@ -190,24 +212,24 @@ internal const val UNIFFI_CALL_UNEXPECTED_ERROR = 2.toByte()
 @Structure.FieldOrder("code", "error_buf")
 internal open class UniffiRustCallStatus : Structure() {
     @JvmField var code: Byte = 0
+
     @JvmField var error_buf: RustBuffer.ByValue = RustBuffer.ByValue()
 
-    class ByValue: UniffiRustCallStatus(), Structure.ByValue
+    class ByValue :
+        UniffiRustCallStatus(),
+        Structure.ByValue
 
-    fun isSuccess(): Boolean {
-        return code == UNIFFI_CALL_SUCCESS
-    }
+    fun isSuccess(): Boolean = code == UNIFFI_CALL_SUCCESS
 
-    fun isError(): Boolean {
-        return code == UNIFFI_CALL_ERROR
-    }
+    fun isError(): Boolean = code == UNIFFI_CALL_ERROR
 
-    fun isPanic(): Boolean {
-        return code == UNIFFI_CALL_UNEXPECTED_ERROR
-    }
+    fun isPanic(): Boolean = code == UNIFFI_CALL_UNEXPECTED_ERROR
 
     companion object {
-        fun create(code: Byte, errorBuf: RustBuffer.ByValue): UniffiRustCallStatus.ByValue {
+        fun create(
+            code: Byte,
+            errorBuf: RustBuffer.ByValue,
+        ): UniffiRustCallStatus.ByValue {
             val callStatus = UniffiRustCallStatus.ByValue()
             callStatus.code = code
             callStatus.error_buf = errorBuf
@@ -216,7 +238,9 @@ internal open class UniffiRustCallStatus : Structure() {
     }
 }
 
-class InternalException(message: String) : kotlin.Exception(message)
+class InternalException(
+    message: String,
+) : kotlin.Exception(message)
 
 /**
  * Each top-level error class has a companion object that can lift the error from the call status's rust buffer
@@ -224,7 +248,7 @@ class InternalException(message: String) : kotlin.Exception(message)
  * @suppress
  */
 interface UniffiRustCallStatusErrorHandler<E> {
-    fun lift(error_buf: RustBuffer.ByValue): E;
+    fun lift(error_buf: RustBuffer.ByValue): E
 }
 
 // Helpers for calling Rust
@@ -232,7 +256,10 @@ interface UniffiRustCallStatusErrorHandler<E> {
 // synchronize itself
 
 // Call a rust function that returns a Result<>.  Pass in the Error class companion that corresponds to the Err
-private inline fun <U, E: kotlin.Exception> uniffiRustCallWithError(errorHandler: UniffiRustCallStatusErrorHandler<E>, callback: (UniffiRustCallStatus) -> U): U {
+private inline fun <U, E : kotlin.Exception> uniffiRustCallWithError(
+    errorHandler: UniffiRustCallStatusErrorHandler<E>,
+    callback: (UniffiRustCallStatus) -> U,
+): U {
     var status = UniffiRustCallStatus()
     val return_value = callback(status)
     uniffiCheckCallStatus(errorHandler, status)
@@ -240,7 +267,10 @@ private inline fun <U, E: kotlin.Exception> uniffiRustCallWithError(errorHandler
 }
 
 // Check UniffiRustCallStatus and throw an error if the call wasn't successful
-private fun<E: kotlin.Exception> uniffiCheckCallStatus(errorHandler: UniffiRustCallStatusErrorHandler<E>, status: UniffiRustCallStatus) {
+private fun <E : kotlin.Exception> uniffiCheckCallStatus(
+    errorHandler: UniffiRustCallStatusErrorHandler<E>,
+    status: UniffiRustCallStatus,
+) {
     if (status.isSuccess()) {
         return
     } else if (status.isError()) {
@@ -264,7 +294,7 @@ private fun<E: kotlin.Exception> uniffiCheckCallStatus(errorHandler: UniffiRustC
  *
  * @suppress
  */
-object UniffiNullRustCallStatusErrorHandler: UniffiRustCallStatusErrorHandler<InternalException> {
+object UniffiNullRustCallStatusErrorHandler : UniffiRustCallStatusErrorHandler<InternalException> {
     override fun lift(error_buf: RustBuffer.ByValue): InternalException {
         RustBuffer.free(error_buf)
         return InternalException("Unexpected CALL_ERROR")
@@ -272,44 +302,54 @@ object UniffiNullRustCallStatusErrorHandler: UniffiRustCallStatusErrorHandler<In
 }
 
 // Call a rust function that returns a plain value
-private inline fun <U> uniffiRustCall(callback: (UniffiRustCallStatus) -> U): U {
-    return uniffiRustCallWithError(UniffiNullRustCallStatusErrorHandler, callback)
-}
+private inline fun <U> uniffiRustCall(callback: (UniffiRustCallStatus) -> U): U =
+    uniffiRustCallWithError(UniffiNullRustCallStatusErrorHandler, callback)
 
-internal inline fun<T> uniffiTraitInterfaceCall(
+internal inline fun <T> uniffiTraitInterfaceCall(
     callStatus: UniffiRustCallStatus,
     makeCall: () -> T,
     writeReturn: (T) -> Unit,
 ) {
     try {
         writeReturn(makeCall())
-    } catch(e: kotlin.Exception) {
-        val err = try { e.stackTraceToString() } catch(_: Throwable) { "" }
+    } catch (e: kotlin.Exception) {
+        val err =
+            try {
+                e.stackTraceToString()
+            } catch (_: Throwable) {
+                ""
+            }
         callStatus.code = UNIFFI_CALL_UNEXPECTED_ERROR
         callStatus.error_buf = FfiConverterString.lower(err)
     }
 }
 
-internal inline fun<T, reified E: Throwable> uniffiTraitInterfaceCallWithError(
+internal inline fun <T, reified E : Throwable> uniffiTraitInterfaceCallWithError(
     callStatus: UniffiRustCallStatus,
     makeCall: () -> T,
     writeReturn: (T) -> Unit,
-    lowerError: (E) -> RustBuffer.ByValue
+    lowerError: (E) -> RustBuffer.ByValue,
 ) {
     try {
         writeReturn(makeCall())
-    } catch(e: kotlin.Exception) {
+    } catch (e: kotlin.Exception) {
         if (e is E) {
             callStatus.code = UNIFFI_CALL_ERROR
             callStatus.error_buf = lowerError(e)
         } else {
-            val err = try { e.stackTraceToString() } catch(_: Throwable) { "" }
+            val err =
+                try {
+                    e.stackTraceToString()
+                } catch (_: Throwable) {
+                    ""
+                }
             callStatus.code = UNIFFI_CALL_UNEXPECTED_ERROR
             callStatus.error_buf = FfiConverterString.lower(err)
         }
     }
 }
-// Initial value and increment amount for handles. 
+
+// Initial value and increment amount for handles.
 // These ensure that Kotlin-generated handles always have the lowest bit set
 private const val UNIFFI_HANDLEMAP_INITIAL = 1.toLong()
 private const val UNIFFI_HANDLEMAP_DELTA = 2.toLong()
@@ -317,10 +357,13 @@ private const val UNIFFI_HANDLEMAP_DELTA = 2.toLong()
 // Map handles to objects
 //
 // This is used pass an opaque 64-bit handle representing a foreign object to the Rust code.
-internal class UniffiHandleMap<T: Any> {
+internal class UniffiHandleMap<T : Any> {
     private val map = ConcurrentHashMap<Long, T>()
-    // Start 
-    private val counter = java.util.concurrent.atomic.AtomicLong(UNIFFI_HANDLEMAP_INITIAL)
+
+    // Start
+    private val counter =
+        java.util.concurrent.atomic
+            .AtomicLong(UNIFFI_HANDLEMAP_INITIAL)
 
     val size: Int
         get() = map.size
@@ -339,14 +382,10 @@ internal class UniffiHandleMap<T: Any> {
     }
 
     // Get an object from the handle map
-    fun get(handle: Long): T {
-        return map.get(handle) ?: throw InternalException("UniffiHandleMap.get: Invalid handle")
-    }
+    fun get(handle: Long): T = map.get(handle) ?: throw InternalException("UniffiHandleMap.get: Invalid handle")
 
     // Remove an entry from the handlemap and get the Kotlin object back
-    fun remove(handle: Long): T {
-        return map.remove(handle) ?: throw InternalException("UniffiHandleMap: Invalid handle")
-    }
+    fun remove(handle: Long): T = map.remove(handle) ?: throw InternalException("UniffiHandleMap: Invalid handle")
 }
 
 // Contains loading, initialization code,
@@ -357,23 +396,29 @@ private fun findLibraryName(componentName: String): String {
     if (libOverride != null) {
         return libOverride
     }
-    return "osm_tile_core"
+    return "osm_tile_engine"
 }
 
 // Define FFI callback types
 internal interface UniffiRustFutureContinuationCallback : com.sun.jna.Callback {
-    fun callback(`data`: Long,`pollResult`: Byte,)
+    fun callback(
+        `data`: Long,
+        `pollResult`: Byte,
+    )
 }
+
 internal interface UniffiForeignFutureDroppedCallback : com.sun.jna.Callback {
-    fun callback(`handle`: Long,)
+    fun callback(`handle`: Long)
 }
+
 internal interface UniffiCallbackInterfaceFree : com.sun.jna.Callback {
-    fun callback(`handle`: Long,)
+    fun callback(`handle`: Long)
 }
+
 internal interface UniffiCallbackInterfaceClone : com.sun.jna.Callback {
-    fun callback(`handle`: Long,)
-    : Long
+    fun callback(`handle`: Long): Long
 }
+
 @Structure.FieldOrder("handle", "free")
 internal open class UniffiForeignFutureDroppedCallbackStruct(
     @JvmField internal var `handle`: Long = 0.toLong(),
@@ -382,14 +427,15 @@ internal open class UniffiForeignFutureDroppedCallbackStruct(
     class UniffiByValue(
         `handle`: Long = 0.toLong(),
         `free`: UniffiForeignFutureDroppedCallback? = null,
-    ): UniffiForeignFutureDroppedCallbackStruct(`handle`,`free`,), Structure.ByValue
+    ) : UniffiForeignFutureDroppedCallbackStruct(`handle`, `free`),
+        Structure.ByValue
 
-   internal fun uniffiSetValue(other: UniffiForeignFutureDroppedCallbackStruct) {
+    internal fun uniffiSetValue(other: UniffiForeignFutureDroppedCallbackStruct) {
         `handle` = other.`handle`
         `free` = other.`free`
     }
-
 }
+
 @Structure.FieldOrder("returnValue", "callStatus")
 internal open class UniffiForeignFutureResultU8(
     @JvmField internal var `returnValue`: Byte = 0.toByte(),
@@ -398,17 +444,22 @@ internal open class UniffiForeignFutureResultU8(
     class UniffiByValue(
         `returnValue`: Byte = 0.toByte(),
         `callStatus`: UniffiRustCallStatus.ByValue = UniffiRustCallStatus.ByValue(),
-    ): UniffiForeignFutureResultU8(`returnValue`,`callStatus`,), Structure.ByValue
+    ) : UniffiForeignFutureResultU8(`returnValue`, `callStatus`),
+        Structure.ByValue
 
-   internal fun uniffiSetValue(other: UniffiForeignFutureResultU8) {
+    internal fun uniffiSetValue(other: UniffiForeignFutureResultU8) {
         `returnValue` = other.`returnValue`
         `callStatus` = other.`callStatus`
     }
+}
 
-}
 internal interface UniffiForeignFutureCompleteU8 : com.sun.jna.Callback {
-    fun callback(`callbackData`: Long,`result`: UniffiForeignFutureResultU8.UniffiByValue,)
+    fun callback(
+        `callbackData`: Long,
+        `result`: UniffiForeignFutureResultU8.UniffiByValue,
+    )
 }
+
 @Structure.FieldOrder("returnValue", "callStatus")
 internal open class UniffiForeignFutureResultI8(
     @JvmField internal var `returnValue`: Byte = 0.toByte(),
@@ -417,17 +468,22 @@ internal open class UniffiForeignFutureResultI8(
     class UniffiByValue(
         `returnValue`: Byte = 0.toByte(),
         `callStatus`: UniffiRustCallStatus.ByValue = UniffiRustCallStatus.ByValue(),
-    ): UniffiForeignFutureResultI8(`returnValue`,`callStatus`,), Structure.ByValue
+    ) : UniffiForeignFutureResultI8(`returnValue`, `callStatus`),
+        Structure.ByValue
 
-   internal fun uniffiSetValue(other: UniffiForeignFutureResultI8) {
+    internal fun uniffiSetValue(other: UniffiForeignFutureResultI8) {
         `returnValue` = other.`returnValue`
         `callStatus` = other.`callStatus`
     }
+}
 
-}
 internal interface UniffiForeignFutureCompleteI8 : com.sun.jna.Callback {
-    fun callback(`callbackData`: Long,`result`: UniffiForeignFutureResultI8.UniffiByValue,)
+    fun callback(
+        `callbackData`: Long,
+        `result`: UniffiForeignFutureResultI8.UniffiByValue,
+    )
 }
+
 @Structure.FieldOrder("returnValue", "callStatus")
 internal open class UniffiForeignFutureResultU16(
     @JvmField internal var `returnValue`: Short = 0.toShort(),
@@ -436,17 +492,22 @@ internal open class UniffiForeignFutureResultU16(
     class UniffiByValue(
         `returnValue`: Short = 0.toShort(),
         `callStatus`: UniffiRustCallStatus.ByValue = UniffiRustCallStatus.ByValue(),
-    ): UniffiForeignFutureResultU16(`returnValue`,`callStatus`,), Structure.ByValue
+    ) : UniffiForeignFutureResultU16(`returnValue`, `callStatus`),
+        Structure.ByValue
 
-   internal fun uniffiSetValue(other: UniffiForeignFutureResultU16) {
+    internal fun uniffiSetValue(other: UniffiForeignFutureResultU16) {
         `returnValue` = other.`returnValue`
         `callStatus` = other.`callStatus`
     }
+}
 
-}
 internal interface UniffiForeignFutureCompleteU16 : com.sun.jna.Callback {
-    fun callback(`callbackData`: Long,`result`: UniffiForeignFutureResultU16.UniffiByValue,)
+    fun callback(
+        `callbackData`: Long,
+        `result`: UniffiForeignFutureResultU16.UniffiByValue,
+    )
 }
+
 @Structure.FieldOrder("returnValue", "callStatus")
 internal open class UniffiForeignFutureResultI16(
     @JvmField internal var `returnValue`: Short = 0.toShort(),
@@ -455,17 +516,22 @@ internal open class UniffiForeignFutureResultI16(
     class UniffiByValue(
         `returnValue`: Short = 0.toShort(),
         `callStatus`: UniffiRustCallStatus.ByValue = UniffiRustCallStatus.ByValue(),
-    ): UniffiForeignFutureResultI16(`returnValue`,`callStatus`,), Structure.ByValue
+    ) : UniffiForeignFutureResultI16(`returnValue`, `callStatus`),
+        Structure.ByValue
 
-   internal fun uniffiSetValue(other: UniffiForeignFutureResultI16) {
+    internal fun uniffiSetValue(other: UniffiForeignFutureResultI16) {
         `returnValue` = other.`returnValue`
         `callStatus` = other.`callStatus`
     }
+}
 
-}
 internal interface UniffiForeignFutureCompleteI16 : com.sun.jna.Callback {
-    fun callback(`callbackData`: Long,`result`: UniffiForeignFutureResultI16.UniffiByValue,)
+    fun callback(
+        `callbackData`: Long,
+        `result`: UniffiForeignFutureResultI16.UniffiByValue,
+    )
 }
+
 @Structure.FieldOrder("returnValue", "callStatus")
 internal open class UniffiForeignFutureResultU32(
     @JvmField internal var `returnValue`: Int = 0,
@@ -474,17 +540,22 @@ internal open class UniffiForeignFutureResultU32(
     class UniffiByValue(
         `returnValue`: Int = 0,
         `callStatus`: UniffiRustCallStatus.ByValue = UniffiRustCallStatus.ByValue(),
-    ): UniffiForeignFutureResultU32(`returnValue`,`callStatus`,), Structure.ByValue
+    ) : UniffiForeignFutureResultU32(`returnValue`, `callStatus`),
+        Structure.ByValue
 
-   internal fun uniffiSetValue(other: UniffiForeignFutureResultU32) {
+    internal fun uniffiSetValue(other: UniffiForeignFutureResultU32) {
         `returnValue` = other.`returnValue`
         `callStatus` = other.`callStatus`
     }
+}
 
-}
 internal interface UniffiForeignFutureCompleteU32 : com.sun.jna.Callback {
-    fun callback(`callbackData`: Long,`result`: UniffiForeignFutureResultU32.UniffiByValue,)
+    fun callback(
+        `callbackData`: Long,
+        `result`: UniffiForeignFutureResultU32.UniffiByValue,
+    )
 }
+
 @Structure.FieldOrder("returnValue", "callStatus")
 internal open class UniffiForeignFutureResultI32(
     @JvmField internal var `returnValue`: Int = 0,
@@ -493,17 +564,22 @@ internal open class UniffiForeignFutureResultI32(
     class UniffiByValue(
         `returnValue`: Int = 0,
         `callStatus`: UniffiRustCallStatus.ByValue = UniffiRustCallStatus.ByValue(),
-    ): UniffiForeignFutureResultI32(`returnValue`,`callStatus`,), Structure.ByValue
+    ) : UniffiForeignFutureResultI32(`returnValue`, `callStatus`),
+        Structure.ByValue
 
-   internal fun uniffiSetValue(other: UniffiForeignFutureResultI32) {
+    internal fun uniffiSetValue(other: UniffiForeignFutureResultI32) {
         `returnValue` = other.`returnValue`
         `callStatus` = other.`callStatus`
     }
+}
 
-}
 internal interface UniffiForeignFutureCompleteI32 : com.sun.jna.Callback {
-    fun callback(`callbackData`: Long,`result`: UniffiForeignFutureResultI32.UniffiByValue,)
+    fun callback(
+        `callbackData`: Long,
+        `result`: UniffiForeignFutureResultI32.UniffiByValue,
+    )
 }
+
 @Structure.FieldOrder("returnValue", "callStatus")
 internal open class UniffiForeignFutureResultU64(
     @JvmField internal var `returnValue`: Long = 0.toLong(),
@@ -512,17 +588,22 @@ internal open class UniffiForeignFutureResultU64(
     class UniffiByValue(
         `returnValue`: Long = 0.toLong(),
         `callStatus`: UniffiRustCallStatus.ByValue = UniffiRustCallStatus.ByValue(),
-    ): UniffiForeignFutureResultU64(`returnValue`,`callStatus`,), Structure.ByValue
+    ) : UniffiForeignFutureResultU64(`returnValue`, `callStatus`),
+        Structure.ByValue
 
-   internal fun uniffiSetValue(other: UniffiForeignFutureResultU64) {
+    internal fun uniffiSetValue(other: UniffiForeignFutureResultU64) {
         `returnValue` = other.`returnValue`
         `callStatus` = other.`callStatus`
     }
+}
 
-}
 internal interface UniffiForeignFutureCompleteU64 : com.sun.jna.Callback {
-    fun callback(`callbackData`: Long,`result`: UniffiForeignFutureResultU64.UniffiByValue,)
+    fun callback(
+        `callbackData`: Long,
+        `result`: UniffiForeignFutureResultU64.UniffiByValue,
+    )
 }
+
 @Structure.FieldOrder("returnValue", "callStatus")
 internal open class UniffiForeignFutureResultI64(
     @JvmField internal var `returnValue`: Long = 0.toLong(),
@@ -531,17 +612,22 @@ internal open class UniffiForeignFutureResultI64(
     class UniffiByValue(
         `returnValue`: Long = 0.toLong(),
         `callStatus`: UniffiRustCallStatus.ByValue = UniffiRustCallStatus.ByValue(),
-    ): UniffiForeignFutureResultI64(`returnValue`,`callStatus`,), Structure.ByValue
+    ) : UniffiForeignFutureResultI64(`returnValue`, `callStatus`),
+        Structure.ByValue
 
-   internal fun uniffiSetValue(other: UniffiForeignFutureResultI64) {
+    internal fun uniffiSetValue(other: UniffiForeignFutureResultI64) {
         `returnValue` = other.`returnValue`
         `callStatus` = other.`callStatus`
     }
+}
 
-}
 internal interface UniffiForeignFutureCompleteI64 : com.sun.jna.Callback {
-    fun callback(`callbackData`: Long,`result`: UniffiForeignFutureResultI64.UniffiByValue,)
+    fun callback(
+        `callbackData`: Long,
+        `result`: UniffiForeignFutureResultI64.UniffiByValue,
+    )
 }
+
 @Structure.FieldOrder("returnValue", "callStatus")
 internal open class UniffiForeignFutureResultF32(
     @JvmField internal var `returnValue`: Float = 0.0f,
@@ -550,17 +636,22 @@ internal open class UniffiForeignFutureResultF32(
     class UniffiByValue(
         `returnValue`: Float = 0.0f,
         `callStatus`: UniffiRustCallStatus.ByValue = UniffiRustCallStatus.ByValue(),
-    ): UniffiForeignFutureResultF32(`returnValue`,`callStatus`,), Structure.ByValue
+    ) : UniffiForeignFutureResultF32(`returnValue`, `callStatus`),
+        Structure.ByValue
 
-   internal fun uniffiSetValue(other: UniffiForeignFutureResultF32) {
+    internal fun uniffiSetValue(other: UniffiForeignFutureResultF32) {
         `returnValue` = other.`returnValue`
         `callStatus` = other.`callStatus`
     }
+}
 
-}
 internal interface UniffiForeignFutureCompleteF32 : com.sun.jna.Callback {
-    fun callback(`callbackData`: Long,`result`: UniffiForeignFutureResultF32.UniffiByValue,)
+    fun callback(
+        `callbackData`: Long,
+        `result`: UniffiForeignFutureResultF32.UniffiByValue,
+    )
 }
+
 @Structure.FieldOrder("returnValue", "callStatus")
 internal open class UniffiForeignFutureResultF64(
     @JvmField internal var `returnValue`: Double = 0.0,
@@ -569,17 +660,22 @@ internal open class UniffiForeignFutureResultF64(
     class UniffiByValue(
         `returnValue`: Double = 0.0,
         `callStatus`: UniffiRustCallStatus.ByValue = UniffiRustCallStatus.ByValue(),
-    ): UniffiForeignFutureResultF64(`returnValue`,`callStatus`,), Structure.ByValue
+    ) : UniffiForeignFutureResultF64(`returnValue`, `callStatus`),
+        Structure.ByValue
 
-   internal fun uniffiSetValue(other: UniffiForeignFutureResultF64) {
+    internal fun uniffiSetValue(other: UniffiForeignFutureResultF64) {
         `returnValue` = other.`returnValue`
         `callStatus` = other.`callStatus`
     }
+}
 
-}
 internal interface UniffiForeignFutureCompleteF64 : com.sun.jna.Callback {
-    fun callback(`callbackData`: Long,`result`: UniffiForeignFutureResultF64.UniffiByValue,)
+    fun callback(
+        `callbackData`: Long,
+        `result`: UniffiForeignFutureResultF64.UniffiByValue,
+    )
 }
+
 @Structure.FieldOrder("returnValue", "callStatus")
 internal open class UniffiForeignFutureResultRustBuffer(
     @JvmField internal var `returnValue`: RustBuffer.ByValue = RustBuffer.ByValue(),
@@ -588,32 +684,41 @@ internal open class UniffiForeignFutureResultRustBuffer(
     class UniffiByValue(
         `returnValue`: RustBuffer.ByValue = RustBuffer.ByValue(),
         `callStatus`: UniffiRustCallStatus.ByValue = UniffiRustCallStatus.ByValue(),
-    ): UniffiForeignFutureResultRustBuffer(`returnValue`,`callStatus`,), Structure.ByValue
+    ) : UniffiForeignFutureResultRustBuffer(`returnValue`, `callStatus`),
+        Structure.ByValue
 
-   internal fun uniffiSetValue(other: UniffiForeignFutureResultRustBuffer) {
+    internal fun uniffiSetValue(other: UniffiForeignFutureResultRustBuffer) {
         `returnValue` = other.`returnValue`
         `callStatus` = other.`callStatus`
     }
+}
 
-}
 internal interface UniffiForeignFutureCompleteRustBuffer : com.sun.jna.Callback {
-    fun callback(`callbackData`: Long,`result`: UniffiForeignFutureResultRustBuffer.UniffiByValue,)
+    fun callback(
+        `callbackData`: Long,
+        `result`: UniffiForeignFutureResultRustBuffer.UniffiByValue,
+    )
 }
+
 @Structure.FieldOrder("callStatus")
 internal open class UniffiForeignFutureResultVoid(
     @JvmField internal var `callStatus`: UniffiRustCallStatus.ByValue = UniffiRustCallStatus.ByValue(),
 ) : Structure() {
     class UniffiByValue(
         `callStatus`: UniffiRustCallStatus.ByValue = UniffiRustCallStatus.ByValue(),
-    ): UniffiForeignFutureResultVoid(`callStatus`,), Structure.ByValue
+    ) : UniffiForeignFutureResultVoid(`callStatus`),
+        Structure.ByValue
 
-   internal fun uniffiSetValue(other: UniffiForeignFutureResultVoid) {
+    internal fun uniffiSetValue(other: UniffiForeignFutureResultVoid) {
         `callStatus` = other.`callStatus`
     }
-
 }
+
 internal interface UniffiForeignFutureCompleteVoid : com.sun.jna.Callback {
-    fun callback(`callbackData`: Long,`result`: UniffiForeignFutureResultVoid.UniffiByValue,)
+    fun callback(
+        `callbackData`: Long,
+        `result`: UniffiForeignFutureResultVoid.UniffiByValue,
+    )
 }
 
 // A JNA Library to expose the extern-C FFI definitions.
@@ -634,219 +739,355 @@ internal interface UniffiForeignFutureCompleteVoid : com.sun.jna.Callback {
 // We now use JNA's "direct mapping" - unclear if same considerations apply exactly.
 internal object IntegrityCheckingUniffiLib {
     init {
-        Native.register(IntegrityCheckingUniffiLib::class.java, findLibraryName(componentName = "osm_tile_core"))
+        Native.register(IntegrityCheckingUniffiLib::class.java, findLibraryName(componentName = "osm_tile_engine"))
         uniffiCheckContractApiVersion(this)
         uniffiCheckApiChecksums(this)
     }
-    external fun uniffi_osm_tile_core_checksum_method_osmtilecore_clear_markers(
-    ): Short
-    external fun uniffi_osm_tile_core_checksum_method_osmtilecore_clustered_all(
-    ): Short
-    external fun uniffi_osm_tile_core_checksum_method_osmtilecore_clustered_markers(
-    ): Short
-    external fun uniffi_osm_tile_core_checksum_method_osmtilecore_load_tile(
-    ): Short
-    external fun uniffi_osm_tile_core_checksum_method_osmtilecore_remove_marker(
-    ): Short
-    external fun uniffi_osm_tile_core_checksum_method_osmtilecore_replace_markers(
-    ): Short
-    external fun uniffi_osm_tile_core_checksum_method_osmtilecore_set_viewport(
-    ): Short
-    external fun uniffi_osm_tile_core_checksum_method_osmtilecore_upsert_markers(
-    ): Short
-    external fun uniffi_osm_tile_core_checksum_method_osmtilecore_visible_markers(
-    ): Short
-    external fun uniffi_osm_tile_core_checksum_constructor_osmtilecore_new(
-    ): Short
-    external fun ffi_osm_tile_core_uniffi_contract_version(
-    ): Int
 
-        
+    external fun uniffi_osm_tile_engine_checksum_method_osmtileengine_clear_markers(): Short
+
+    external fun uniffi_osm_tile_engine_checksum_method_osmtileengine_clustered_all(): Short
+
+    external fun uniffi_osm_tile_engine_checksum_method_osmtileengine_clustered_markers(): Short
+
+    external fun uniffi_osm_tile_engine_checksum_method_osmtileengine_load_tile(): Short
+
+    external fun uniffi_osm_tile_engine_checksum_method_osmtileengine_remove_marker(): Short
+
+    external fun uniffi_osm_tile_engine_checksum_method_osmtileengine_replace_markers(): Short
+
+    external fun uniffi_osm_tile_engine_checksum_method_osmtileengine_set_viewport(): Short
+
+    external fun uniffi_osm_tile_engine_checksum_method_osmtileengine_upsert_markers(): Short
+
+    external fun uniffi_osm_tile_engine_checksum_method_osmtileengine_visible_markers(): Short
+
+    external fun uniffi_osm_tile_engine_checksum_constructor_osmtileengine_new(): Short
+
+    external fun ffi_osm_tile_engine_uniffi_contract_version(): Int
 }
 
 internal object UniffiLib {
-    
     // The Cleaner for the whole library
     internal val CLEANER: UniffiCleaner by lazy {
         UniffiCleaner.create()
     }
-    
 
     init {
-        Native.register(UniffiLib::class.java, findLibraryName(componentName = "osm_tile_core"))
-        
+        Native.register(UniffiLib::class.java, findLibraryName(componentName = "osm_tile_engine"))
     }
-    external fun uniffi_osm_tile_core_fn_clone_osmtilecore(`handle`: Long,uniffi_out_err: UniffiRustCallStatus, 
+
+    external fun uniffi_osm_tile_engine_fn_clone_osmtileengine(
+        `handle`: Long,
+        uniffi_out_err: UniffiRustCallStatus,
     ): Long
-    external fun uniffi_osm_tile_core_fn_free_osmtilecore(`handle`: Long,uniffi_out_err: UniffiRustCallStatus, 
-    ): Unit
-    external fun uniffi_osm_tile_core_fn_constructor_osmtilecore_new(`tileUrlTemplate`: RustBuffer.ByValue,`cacheDir`: RustBuffer.ByValue,uniffi_out_err: UniffiRustCallStatus, 
-    ): Long
-    external fun uniffi_osm_tile_core_fn_method_osmtilecore_clear_markers(`ptr`: Long,uniffi_out_err: UniffiRustCallStatus, 
-    ): Unit
-    external fun uniffi_osm_tile_core_fn_method_osmtilecore_clustered_all(`ptr`: Long,`zoom`: Long,uniffi_out_err: UniffiRustCallStatus, 
-    ): RustBuffer.ByValue
-    external fun uniffi_osm_tile_core_fn_method_osmtilecore_clustered_markers(`ptr`: Long,uniffi_out_err: UniffiRustCallStatus, 
-    ): RustBuffer.ByValue
-    external fun uniffi_osm_tile_core_fn_method_osmtilecore_load_tile(`ptr`: Long,`z`: Long,`x`: Long,`y`: Long,uniffi_out_err: UniffiRustCallStatus, 
-    ): RustBuffer.ByValue
-    external fun uniffi_osm_tile_core_fn_method_osmtilecore_remove_marker(`ptr`: Long,`id`: Long,uniffi_out_err: UniffiRustCallStatus, 
-    ): Unit
-    external fun uniffi_osm_tile_core_fn_method_osmtilecore_replace_markers(`ptr`: Long,`markers`: RustBuffer.ByValue,uniffi_out_err: UniffiRustCallStatus, 
-    ): Unit
-    external fun uniffi_osm_tile_core_fn_method_osmtilecore_set_viewport(`ptr`: Long,`viewport`: RustBuffer.ByValue,uniffi_out_err: UniffiRustCallStatus, 
-    ): Unit
-    external fun uniffi_osm_tile_core_fn_method_osmtilecore_upsert_markers(`ptr`: Long,`markers`: RustBuffer.ByValue,uniffi_out_err: UniffiRustCallStatus, 
-    ): Unit
-    external fun uniffi_osm_tile_core_fn_method_osmtilecore_visible_markers(`ptr`: Long,uniffi_out_err: UniffiRustCallStatus, 
-    ): RustBuffer.ByValue
-    external fun ffi_osm_tile_core_rustbuffer_alloc(`size`: Long,uniffi_out_err: UniffiRustCallStatus, 
-    ): RustBuffer.ByValue
-    external fun ffi_osm_tile_core_rustbuffer_from_bytes(`bytes`: ForeignBytes.ByValue,uniffi_out_err: UniffiRustCallStatus, 
-    ): RustBuffer.ByValue
-    external fun ffi_osm_tile_core_rustbuffer_free(`buf`: RustBuffer.ByValue,uniffi_out_err: UniffiRustCallStatus, 
-    ): Unit
-    external fun ffi_osm_tile_core_rustbuffer_reserve(`buf`: RustBuffer.ByValue,`additional`: Long,uniffi_out_err: UniffiRustCallStatus, 
-    ): RustBuffer.ByValue
-    external fun ffi_osm_tile_core_rust_future_poll_u8(`handle`: Long,`callback`: UniffiRustFutureContinuationCallback,`callbackData`: Long,
-    ): Unit
-    external fun ffi_osm_tile_core_rust_future_cancel_u8(`handle`: Long,
-    ): Unit
-    external fun ffi_osm_tile_core_rust_future_free_u8(`handle`: Long,
-    ): Unit
-    external fun ffi_osm_tile_core_rust_future_complete_u8(`handle`: Long,uniffi_out_err: UniffiRustCallStatus, 
-    ): Byte
-    external fun ffi_osm_tile_core_rust_future_poll_i8(`handle`: Long,`callback`: UniffiRustFutureContinuationCallback,`callbackData`: Long,
-    ): Unit
-    external fun ffi_osm_tile_core_rust_future_cancel_i8(`handle`: Long,
-    ): Unit
-    external fun ffi_osm_tile_core_rust_future_free_i8(`handle`: Long,
-    ): Unit
-    external fun ffi_osm_tile_core_rust_future_complete_i8(`handle`: Long,uniffi_out_err: UniffiRustCallStatus, 
-    ): Byte
-    external fun ffi_osm_tile_core_rust_future_poll_u16(`handle`: Long,`callback`: UniffiRustFutureContinuationCallback,`callbackData`: Long,
-    ): Unit
-    external fun ffi_osm_tile_core_rust_future_cancel_u16(`handle`: Long,
-    ): Unit
-    external fun ffi_osm_tile_core_rust_future_free_u16(`handle`: Long,
-    ): Unit
-    external fun ffi_osm_tile_core_rust_future_complete_u16(`handle`: Long,uniffi_out_err: UniffiRustCallStatus, 
-    ): Short
-    external fun ffi_osm_tile_core_rust_future_poll_i16(`handle`: Long,`callback`: UniffiRustFutureContinuationCallback,`callbackData`: Long,
-    ): Unit
-    external fun ffi_osm_tile_core_rust_future_cancel_i16(`handle`: Long,
-    ): Unit
-    external fun ffi_osm_tile_core_rust_future_free_i16(`handle`: Long,
-    ): Unit
-    external fun ffi_osm_tile_core_rust_future_complete_i16(`handle`: Long,uniffi_out_err: UniffiRustCallStatus, 
-    ): Short
-    external fun ffi_osm_tile_core_rust_future_poll_u32(`handle`: Long,`callback`: UniffiRustFutureContinuationCallback,`callbackData`: Long,
-    ): Unit
-    external fun ffi_osm_tile_core_rust_future_cancel_u32(`handle`: Long,
-    ): Unit
-    external fun ffi_osm_tile_core_rust_future_free_u32(`handle`: Long,
-    ): Unit
-    external fun ffi_osm_tile_core_rust_future_complete_u32(`handle`: Long,uniffi_out_err: UniffiRustCallStatus, 
-    ): Int
-    external fun ffi_osm_tile_core_rust_future_poll_i32(`handle`: Long,`callback`: UniffiRustFutureContinuationCallback,`callbackData`: Long,
-    ): Unit
-    external fun ffi_osm_tile_core_rust_future_cancel_i32(`handle`: Long,
-    ): Unit
-    external fun ffi_osm_tile_core_rust_future_free_i32(`handle`: Long,
-    ): Unit
-    external fun ffi_osm_tile_core_rust_future_complete_i32(`handle`: Long,uniffi_out_err: UniffiRustCallStatus, 
-    ): Int
-    external fun ffi_osm_tile_core_rust_future_poll_u64(`handle`: Long,`callback`: UniffiRustFutureContinuationCallback,`callbackData`: Long,
-    ): Unit
-    external fun ffi_osm_tile_core_rust_future_cancel_u64(`handle`: Long,
-    ): Unit
-    external fun ffi_osm_tile_core_rust_future_free_u64(`handle`: Long,
-    ): Unit
-    external fun ffi_osm_tile_core_rust_future_complete_u64(`handle`: Long,uniffi_out_err: UniffiRustCallStatus, 
-    ): Long
-    external fun ffi_osm_tile_core_rust_future_poll_i64(`handle`: Long,`callback`: UniffiRustFutureContinuationCallback,`callbackData`: Long,
-    ): Unit
-    external fun ffi_osm_tile_core_rust_future_cancel_i64(`handle`: Long,
-    ): Unit
-    external fun ffi_osm_tile_core_rust_future_free_i64(`handle`: Long,
-    ): Unit
-    external fun ffi_osm_tile_core_rust_future_complete_i64(`handle`: Long,uniffi_out_err: UniffiRustCallStatus, 
-    ): Long
-    external fun ffi_osm_tile_core_rust_future_poll_f32(`handle`: Long,`callback`: UniffiRustFutureContinuationCallback,`callbackData`: Long,
-    ): Unit
-    external fun ffi_osm_tile_core_rust_future_cancel_f32(`handle`: Long,
-    ): Unit
-    external fun ffi_osm_tile_core_rust_future_free_f32(`handle`: Long,
-    ): Unit
-    external fun ffi_osm_tile_core_rust_future_complete_f32(`handle`: Long,uniffi_out_err: UniffiRustCallStatus, 
-    ): Float
-    external fun ffi_osm_tile_core_rust_future_poll_f64(`handle`: Long,`callback`: UniffiRustFutureContinuationCallback,`callbackData`: Long,
-    ): Unit
-    external fun ffi_osm_tile_core_rust_future_cancel_f64(`handle`: Long,
-    ): Unit
-    external fun ffi_osm_tile_core_rust_future_free_f64(`handle`: Long,
-    ): Unit
-    external fun ffi_osm_tile_core_rust_future_complete_f64(`handle`: Long,uniffi_out_err: UniffiRustCallStatus, 
-    ): Double
-    external fun ffi_osm_tile_core_rust_future_poll_rust_buffer(`handle`: Long,`callback`: UniffiRustFutureContinuationCallback,`callbackData`: Long,
-    ): Unit
-    external fun ffi_osm_tile_core_rust_future_cancel_rust_buffer(`handle`: Long,
-    ): Unit
-    external fun ffi_osm_tile_core_rust_future_free_rust_buffer(`handle`: Long,
-    ): Unit
-    external fun ffi_osm_tile_core_rust_future_complete_rust_buffer(`handle`: Long,uniffi_out_err: UniffiRustCallStatus, 
-    ): RustBuffer.ByValue
-    external fun ffi_osm_tile_core_rust_future_poll_void(`handle`: Long,`callback`: UniffiRustFutureContinuationCallback,`callbackData`: Long,
-    ): Unit
-    external fun ffi_osm_tile_core_rust_future_cancel_void(`handle`: Long,
-    ): Unit
-    external fun ffi_osm_tile_core_rust_future_free_void(`handle`: Long,
-    ): Unit
-    external fun ffi_osm_tile_core_rust_future_complete_void(`handle`: Long,uniffi_out_err: UniffiRustCallStatus, 
+
+    external fun uniffi_osm_tile_engine_fn_free_osmtileengine(
+        `handle`: Long,
+        uniffi_out_err: UniffiRustCallStatus,
     ): Unit
 
-        
+    external fun uniffi_osm_tile_engine_fn_constructor_osmtileengine_new(
+        `tileUrlTemplate`: RustBuffer.ByValue,
+        `cacheDir`: RustBuffer.ByValue,
+        uniffi_out_err: UniffiRustCallStatus,
+    ): Long
+
+    external fun uniffi_osm_tile_engine_fn_method_osmtileengine_clear_markers(
+        `ptr`: Long,
+        uniffi_out_err: UniffiRustCallStatus,
+    ): Unit
+
+    external fun uniffi_osm_tile_engine_fn_method_osmtileengine_clustered_all(
+        `ptr`: Long,
+        `zoom`: Long,
+        uniffi_out_err: UniffiRustCallStatus,
+    ): RustBuffer.ByValue
+
+    external fun uniffi_osm_tile_engine_fn_method_osmtileengine_clustered_markers(
+        `ptr`: Long,
+        uniffi_out_err: UniffiRustCallStatus,
+    ): RustBuffer.ByValue
+
+    external fun uniffi_osm_tile_engine_fn_method_osmtileengine_load_tile(
+        `ptr`: Long,
+        `z`: Long,
+        `x`: Long,
+        `y`: Long,
+        uniffi_out_err: UniffiRustCallStatus,
+    ): RustBuffer.ByValue
+
+    external fun uniffi_osm_tile_engine_fn_method_osmtileengine_remove_marker(
+        `ptr`: Long,
+        `id`: Long,
+        uniffi_out_err: UniffiRustCallStatus,
+    ): Unit
+
+    external fun uniffi_osm_tile_engine_fn_method_osmtileengine_replace_markers(
+        `ptr`: Long,
+        `markers`: RustBuffer.ByValue,
+        uniffi_out_err: UniffiRustCallStatus,
+    ): Unit
+
+    external fun uniffi_osm_tile_engine_fn_method_osmtileengine_set_viewport(
+        `ptr`: Long,
+        `viewport`: RustBuffer.ByValue,
+        uniffi_out_err: UniffiRustCallStatus,
+    ): Unit
+
+    external fun uniffi_osm_tile_engine_fn_method_osmtileengine_upsert_markers(
+        `ptr`: Long,
+        `markers`: RustBuffer.ByValue,
+        uniffi_out_err: UniffiRustCallStatus,
+    ): Unit
+
+    external fun uniffi_osm_tile_engine_fn_method_osmtileengine_visible_markers(
+        `ptr`: Long,
+        uniffi_out_err: UniffiRustCallStatus,
+    ): RustBuffer.ByValue
+
+    external fun ffi_osm_tile_engine_rustbuffer_alloc(
+        `size`: Long,
+        uniffi_out_err: UniffiRustCallStatus,
+    ): RustBuffer.ByValue
+
+    external fun ffi_osm_tile_engine_rustbuffer_from_bytes(
+        `bytes`: ForeignBytes.ByValue,
+        uniffi_out_err: UniffiRustCallStatus,
+    ): RustBuffer.ByValue
+
+    external fun ffi_osm_tile_engine_rustbuffer_free(
+        `buf`: RustBuffer.ByValue,
+        uniffi_out_err: UniffiRustCallStatus,
+    ): Unit
+
+    external fun ffi_osm_tile_engine_rustbuffer_reserve(
+        `buf`: RustBuffer.ByValue,
+        `additional`: Long,
+        uniffi_out_err: UniffiRustCallStatus,
+    ): RustBuffer.ByValue
+
+    external fun ffi_osm_tile_engine_rust_future_poll_u8(
+        `handle`: Long,
+        `callback`: UniffiRustFutureContinuationCallback,
+        `callbackData`: Long,
+    ): Unit
+
+    external fun ffi_osm_tile_engine_rust_future_cancel_u8(`handle`: Long): Unit
+
+    external fun ffi_osm_tile_engine_rust_future_free_u8(`handle`: Long): Unit
+
+    external fun ffi_osm_tile_engine_rust_future_complete_u8(
+        `handle`: Long,
+        uniffi_out_err: UniffiRustCallStatus,
+    ): Byte
+
+    external fun ffi_osm_tile_engine_rust_future_poll_i8(
+        `handle`: Long,
+        `callback`: UniffiRustFutureContinuationCallback,
+        `callbackData`: Long,
+    ): Unit
+
+    external fun ffi_osm_tile_engine_rust_future_cancel_i8(`handle`: Long): Unit
+
+    external fun ffi_osm_tile_engine_rust_future_free_i8(`handle`: Long): Unit
+
+    external fun ffi_osm_tile_engine_rust_future_complete_i8(
+        `handle`: Long,
+        uniffi_out_err: UniffiRustCallStatus,
+    ): Byte
+
+    external fun ffi_osm_tile_engine_rust_future_poll_u16(
+        `handle`: Long,
+        `callback`: UniffiRustFutureContinuationCallback,
+        `callbackData`: Long,
+    ): Unit
+
+    external fun ffi_osm_tile_engine_rust_future_cancel_u16(`handle`: Long): Unit
+
+    external fun ffi_osm_tile_engine_rust_future_free_u16(`handle`: Long): Unit
+
+    external fun ffi_osm_tile_engine_rust_future_complete_u16(
+        `handle`: Long,
+        uniffi_out_err: UniffiRustCallStatus,
+    ): Short
+
+    external fun ffi_osm_tile_engine_rust_future_poll_i16(
+        `handle`: Long,
+        `callback`: UniffiRustFutureContinuationCallback,
+        `callbackData`: Long,
+    ): Unit
+
+    external fun ffi_osm_tile_engine_rust_future_cancel_i16(`handle`: Long): Unit
+
+    external fun ffi_osm_tile_engine_rust_future_free_i16(`handle`: Long): Unit
+
+    external fun ffi_osm_tile_engine_rust_future_complete_i16(
+        `handle`: Long,
+        uniffi_out_err: UniffiRustCallStatus,
+    ): Short
+
+    external fun ffi_osm_tile_engine_rust_future_poll_u32(
+        `handle`: Long,
+        `callback`: UniffiRustFutureContinuationCallback,
+        `callbackData`: Long,
+    ): Unit
+
+    external fun ffi_osm_tile_engine_rust_future_cancel_u32(`handle`: Long): Unit
+
+    external fun ffi_osm_tile_engine_rust_future_free_u32(`handle`: Long): Unit
+
+    external fun ffi_osm_tile_engine_rust_future_complete_u32(
+        `handle`: Long,
+        uniffi_out_err: UniffiRustCallStatus,
+    ): Int
+
+    external fun ffi_osm_tile_engine_rust_future_poll_i32(
+        `handle`: Long,
+        `callback`: UniffiRustFutureContinuationCallback,
+        `callbackData`: Long,
+    ): Unit
+
+    external fun ffi_osm_tile_engine_rust_future_cancel_i32(`handle`: Long): Unit
+
+    external fun ffi_osm_tile_engine_rust_future_free_i32(`handle`: Long): Unit
+
+    external fun ffi_osm_tile_engine_rust_future_complete_i32(
+        `handle`: Long,
+        uniffi_out_err: UniffiRustCallStatus,
+    ): Int
+
+    external fun ffi_osm_tile_engine_rust_future_poll_u64(
+        `handle`: Long,
+        `callback`: UniffiRustFutureContinuationCallback,
+        `callbackData`: Long,
+    ): Unit
+
+    external fun ffi_osm_tile_engine_rust_future_cancel_u64(`handle`: Long): Unit
+
+    external fun ffi_osm_tile_engine_rust_future_free_u64(`handle`: Long): Unit
+
+    external fun ffi_osm_tile_engine_rust_future_complete_u64(
+        `handle`: Long,
+        uniffi_out_err: UniffiRustCallStatus,
+    ): Long
+
+    external fun ffi_osm_tile_engine_rust_future_poll_i64(
+        `handle`: Long,
+        `callback`: UniffiRustFutureContinuationCallback,
+        `callbackData`: Long,
+    ): Unit
+
+    external fun ffi_osm_tile_engine_rust_future_cancel_i64(`handle`: Long): Unit
+
+    external fun ffi_osm_tile_engine_rust_future_free_i64(`handle`: Long): Unit
+
+    external fun ffi_osm_tile_engine_rust_future_complete_i64(
+        `handle`: Long,
+        uniffi_out_err: UniffiRustCallStatus,
+    ): Long
+
+    external fun ffi_osm_tile_engine_rust_future_poll_f32(
+        `handle`: Long,
+        `callback`: UniffiRustFutureContinuationCallback,
+        `callbackData`: Long,
+    ): Unit
+
+    external fun ffi_osm_tile_engine_rust_future_cancel_f32(`handle`: Long): Unit
+
+    external fun ffi_osm_tile_engine_rust_future_free_f32(`handle`: Long): Unit
+
+    external fun ffi_osm_tile_engine_rust_future_complete_f32(
+        `handle`: Long,
+        uniffi_out_err: UniffiRustCallStatus,
+    ): Float
+
+    external fun ffi_osm_tile_engine_rust_future_poll_f64(
+        `handle`: Long,
+        `callback`: UniffiRustFutureContinuationCallback,
+        `callbackData`: Long,
+    ): Unit
+
+    external fun ffi_osm_tile_engine_rust_future_cancel_f64(`handle`: Long): Unit
+
+    external fun ffi_osm_tile_engine_rust_future_free_f64(`handle`: Long): Unit
+
+    external fun ffi_osm_tile_engine_rust_future_complete_f64(
+        `handle`: Long,
+        uniffi_out_err: UniffiRustCallStatus,
+    ): Double
+
+    external fun ffi_osm_tile_engine_rust_future_poll_rust_buffer(
+        `handle`: Long,
+        `callback`: UniffiRustFutureContinuationCallback,
+        `callbackData`: Long,
+    ): Unit
+
+    external fun ffi_osm_tile_engine_rust_future_cancel_rust_buffer(`handle`: Long): Unit
+
+    external fun ffi_osm_tile_engine_rust_future_free_rust_buffer(`handle`: Long): Unit
+
+    external fun ffi_osm_tile_engine_rust_future_complete_rust_buffer(
+        `handle`: Long,
+        uniffi_out_err: UniffiRustCallStatus,
+    ): RustBuffer.ByValue
+
+    external fun ffi_osm_tile_engine_rust_future_poll_void(
+        `handle`: Long,
+        `callback`: UniffiRustFutureContinuationCallback,
+        `callbackData`: Long,
+    ): Unit
+
+    external fun ffi_osm_tile_engine_rust_future_cancel_void(`handle`: Long): Unit
+
+    external fun ffi_osm_tile_engine_rust_future_free_void(`handle`: Long): Unit
+
+    external fun ffi_osm_tile_engine_rust_future_complete_void(
+        `handle`: Long,
+        uniffi_out_err: UniffiRustCallStatus,
+    ): Unit
 }
 
 private fun uniffiCheckContractApiVersion(lib: IntegrityCheckingUniffiLib) {
     // Get the bindings contract version from our ComponentInterface
     val bindings_contract_version = 30
     // Get the scaffolding contract version by calling the into the dylib
-    val scaffolding_contract_version = lib.ffi_osm_tile_core_uniffi_contract_version()
+    val scaffolding_contract_version = lib.ffi_osm_tile_engine_uniffi_contract_version()
     if (bindings_contract_version != scaffolding_contract_version) {
         throw RuntimeException("UniFFI contract version mismatch: try cleaning and rebuilding your project")
     }
 }
+
 @Suppress("UNUSED_PARAMETER")
 private fun uniffiCheckApiChecksums(lib: IntegrityCheckingUniffiLib) {
-    if (lib.uniffi_osm_tile_core_checksum_method_osmtilecore_clear_markers() != 41979.toShort()) {
+    if (lib.uniffi_osm_tile_engine_checksum_method_osmtileengine_clear_markers() != 57017.toShort()) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
-    if (lib.uniffi_osm_tile_core_checksum_method_osmtilecore_clustered_all() != 62518.toShort()) {
+    if (lib.uniffi_osm_tile_engine_checksum_method_osmtileengine_clustered_all() != 33209.toShort()) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
-    if (lib.uniffi_osm_tile_core_checksum_method_osmtilecore_clustered_markers() != 14318.toShort()) {
+    if (lib.uniffi_osm_tile_engine_checksum_method_osmtileengine_clustered_markers() != 748.toShort()) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
-    if (lib.uniffi_osm_tile_core_checksum_method_osmtilecore_load_tile() != 53716.toShort()) {
+    if (lib.uniffi_osm_tile_engine_checksum_method_osmtileengine_load_tile() != 29026.toShort()) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
-    if (lib.uniffi_osm_tile_core_checksum_method_osmtilecore_remove_marker() != 42478.toShort()) {
+    if (lib.uniffi_osm_tile_engine_checksum_method_osmtileengine_remove_marker() != 29642.toShort()) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
-    if (lib.uniffi_osm_tile_core_checksum_method_osmtilecore_replace_markers() != 52436.toShort()) {
+    if (lib.uniffi_osm_tile_engine_checksum_method_osmtileengine_replace_markers() != 29716.toShort()) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
-    if (lib.uniffi_osm_tile_core_checksum_method_osmtilecore_set_viewport() != 4635.toShort()) {
+    if (lib.uniffi_osm_tile_engine_checksum_method_osmtileengine_set_viewport() != 43979.toShort()) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
-    if (lib.uniffi_osm_tile_core_checksum_method_osmtilecore_upsert_markers() != 38029.toShort()) {
+    if (lib.uniffi_osm_tile_engine_checksum_method_osmtileengine_upsert_markers() != 52393.toShort()) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
-    if (lib.uniffi_osm_tile_core_checksum_method_osmtilecore_visible_markers() != 61696.toShort()) {
+    if (lib.uniffi_osm_tile_engine_checksum_method_osmtileengine_visible_markers() != 22906.toShort()) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
-    if (lib.uniffi_osm_tile_core_checksum_constructor_osmtilecore_new() != 51926.toShort()) {
+    if (lib.uniffi_osm_tile_engine_checksum_constructor_osmtileengine_new() != 31881.toShort()) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
 }
@@ -865,7 +1106,6 @@ public fun uniffiEnsureInitialized() {
 
 // Public interface members begin here.
 
-
 // Interface implemented by anything that can contain an object reference.
 //
 // Such types expose a `destroy()` method that must be called to cleanly
@@ -876,11 +1116,15 @@ public fun uniffiEnsureInitialized() {
 // helper method to execute a block and destroy the object at the end.
 interface Disposable {
     fun destroy()
+
     companion object {
         fun destroy(vararg args: Any?) {
             for (arg in args) {
                 when (arg) {
-                    is Disposable -> arg.destroy()
+                    is Disposable -> {
+                        arg.destroy()
+                    }
+
                     is ArrayList<*> -> {
                         for (idx in arg.indices) {
                             val element = arg[idx]
@@ -889,6 +1133,7 @@ interface Disposable {
                             }
                         }
                     }
+
                     is Map<*, *> -> {
                         for (element in arg.values) {
                             if (element is Disposable) {
@@ -896,6 +1141,7 @@ interface Disposable {
                             }
                         }
                     }
+
                     is Iterable<*> -> {
                         for (element in arg) {
                             if (element is Disposable) {
@@ -924,7 +1170,7 @@ inline fun <T : Disposable?, R> T.use(block: (T) -> R) =
         }
     }
 
-/** 
+/**
  * Placeholder object used to signal that we're constructing an interface with a FFI handle.
  *
  * This is the first argument for interface constructors that input a raw handle. It exists is that
@@ -935,12 +1181,13 @@ inline fun <T : Disposable?, R> T.use(block: (T) -> R) =
  * */
 object UniffiWithHandle
 
-/** 
+/**
  * Used to instantiate an interface without an actual pointer, for fakes in tests, mostly.
  *
  * @suppress
  * */
 object NoHandle
+
 /**
  * The cleaner interface for Object finalization code to run.
  * This is the entry point to any implementation that we're using.
@@ -956,17 +1203,24 @@ interface UniffiCleaner {
         fun clean()
     }
 
-    fun register(value: Any, cleanUpTask: Runnable): UniffiCleaner.Cleanable
+    fun register(
+        value: Any,
+        cleanUpTask: Runnable,
+    ): UniffiCleaner.Cleanable
 
     companion object
 }
 
 // The fallback Jna cleaner, which is available for both Android, and the JVM.
 private class UniffiJnaCleaner : UniffiCleaner {
-    private val cleaner = com.sun.jna.internal.Cleaner.getCleaner()
+    private val cleaner =
+        com.sun.jna.internal.Cleaner
+            .getCleaner()
 
-    override fun register(value: Any, cleanUpTask: Runnable): UniffiCleaner.Cleanable =
-        UniffiJnaCleanable(cleaner.register(value, cleanUpTask))
+    override fun register(
+        value: Any,
+        cleanUpTask: Runnable,
+    ): UniffiCleaner.Cleanable = UniffiJnaCleanable(cleaner.register(value, cleanUpTask))
 }
 
 private class UniffiJnaCleanable(
@@ -975,12 +1229,10 @@ private class UniffiJnaCleanable(
     override fun clean() = cleanable.clean()
 }
 
-
 // We decide at uniffi binding generation time whether we were
 // using Android or not.
 // There are further runtime checks to chose the correct implementation
 // of the cleaner.
-
 
 private fun UniffiCleaner.Companion.create(): UniffiCleaner =
     if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.UPSIDE_DOWN_CAKE) {
@@ -995,8 +1247,10 @@ private fun UniffiCleaner.Companion.create(): UniffiCleaner =
 private class AndroidSystemCleaner : UniffiCleaner {
     val cleaner = android.system.SystemCleaner.cleaner()
 
-    override fun register(value: Any, cleanUpTask: Runnable): UniffiCleaner.Cleanable =
-        AndroidSystemCleanable(cleaner.register(value, cleanUpTask))
+    override fun register(
+        value: Any,
+        cleanUpTask: Runnable,
+    ): UniffiCleaner.Cleanable = AndroidSystemCleanable(cleaner.register(value, cleanUpTask))
 }
 
 @RequiresApi(Build.VERSION_CODES.UPSIDE_DOWN_CAKE)
@@ -1009,22 +1263,19 @@ private class AndroidSystemCleanable(
 /**
  * @suppress
  */
-public object FfiConverterLong: FfiConverter<Long, Long> {
-    override fun lift(value: Long): Long {
-        return value
-    }
+public object FfiConverterLong : FfiConverter<Long, Long> {
+    override fun lift(value: Long): Long = value
 
-    override fun read(buf: ByteBuffer): Long {
-        return buf.getLong()
-    }
+    override fun read(buf: ByteBuffer): Long = buf.getLong()
 
-    override fun lower(value: Long): Long {
-        return value
-    }
+    override fun lower(value: Long): Long = value
 
     override fun allocationSize(value: Long) = 8UL
 
-    override fun write(value: Long, buf: ByteBuffer) {
+    override fun write(
+        value: Long,
+        buf: ByteBuffer,
+    ) {
         buf.putLong(value)
     }
 }
@@ -1032,22 +1283,19 @@ public object FfiConverterLong: FfiConverter<Long, Long> {
 /**
  * @suppress
  */
-public object FfiConverterDouble: FfiConverter<Double, Double> {
-    override fun lift(value: Double): Double {
-        return value
-    }
+public object FfiConverterDouble : FfiConverter<Double, Double> {
+    override fun lift(value: Double): Double = value
 
-    override fun read(buf: ByteBuffer): Double {
-        return buf.getDouble()
-    }
+    override fun read(buf: ByteBuffer): Double = buf.getDouble()
 
-    override fun lower(value: Double): Double {
-        return value
-    }
+    override fun lower(value: Double): Double = value
 
     override fun allocationSize(value: Double) = 8UL
 
-    override fun write(value: Double, buf: ByteBuffer) {
+    override fun write(
+        value: Double,
+        buf: ByteBuffer,
+    ) {
         buf.putDouble(value)
     }
 }
@@ -1055,7 +1303,7 @@ public object FfiConverterDouble: FfiConverter<Double, Double> {
 /**
  * @suppress
  */
-public object FfiConverterString: FfiConverter<String, RustBuffer.ByValue> {
+public object FfiConverterString : FfiConverter<String, RustBuffer.ByValue> {
     // Note: we don't inherit from FfiConverterRustBuffer, because we use a
     // special encoding when lowering/lifting.  We can use `RustBuffer.len` to
     // store our length and avoid writing it out to the buffer.
@@ -1102,7 +1350,10 @@ public object FfiConverterString: FfiConverter<String, RustBuffer.ByValue> {
         return sizeForLength + sizeForString
     }
 
-    override fun write(value: String, buf: ByteBuffer) {
+    override fun write(
+        value: String,
+        buf: ByteBuffer,
+    ) {
         val byteBuf = toUtf8(value)
         buf.putInt(byteBuf.limit())
         buf.put(byteBuf)
@@ -1112,22 +1363,24 @@ public object FfiConverterString: FfiConverter<String, RustBuffer.ByValue> {
 /**
  * @suppress
  */
-public object FfiConverterByteArray: FfiConverterRustBuffer<ByteArray> {
+public object FfiConverterByteArray : FfiConverterRustBuffer<ByteArray> {
     override fun read(buf: ByteBuffer): ByteArray {
         val len = buf.getInt()
         val byteArr = ByteArray(len)
         buf.get(byteArr)
         return byteArr
     }
-    override fun allocationSize(value: ByteArray): ULong {
-        return 4UL + value.size.toULong()
-    }
-    override fun write(value: ByteArray, buf: ByteBuffer) {
+
+    override fun allocationSize(value: ByteArray): ULong = 4UL + value.size.toULong()
+
+    override fun write(
+        value: ByteArray,
+        buf: ByteBuffer,
+    ) {
         buf.putInt(value.size)
         buf.put(value)
     }
 }
-
 
 // This template implements a class for working with a Rust struct via a handle
 // to the live Rust struct on the other side of the FFI.
@@ -1223,7 +1476,6 @@ public object FfiConverterByteArray: FfiConverterRustBuffer<ByteArray> {
 // [1] https://stackoverflow.com/questions/24376768/can-java-finalize-an-object-when-it-is-still-in-scope/24380219
 //
 
-
 /**
  * Main entry point for Android and iOS apps.
  *
@@ -1233,13 +1485,12 @@ public object FfiConverterByteArray: FfiConverterRustBuffer<ByteArray> {
  * background thread, coroutine dispatcher, or Swift task instead of the UI
  * thread.
  */
-public interface OsmTileCoreInterface {
-    
+public interface OsmTileEngineInterface {
     /**
      * Clears all markers from the Rust marker store.
      */
     fun `clearMarkers`()
-    
+
     /**
      * Clusters every marker loaded into Rust for the given zoom.
      *
@@ -1247,7 +1498,7 @@ public interface OsmTileCoreInterface {
      * visibility range.
      */
     fun `clusteredAll`(`zoom`: kotlin.Long): List<MobileMarkerRenderItem>
-    
+
     /**
      * Returns marker and cluster render items visible in the current viewport.
      *
@@ -1255,7 +1506,7 @@ public interface OsmTileCoreInterface {
      * The UI should render markers and clusters using its own icons and views.
      */
     fun `clusteredMarkers`(): List<MobileMarkerRenderItem>
-    
+
     /**
      * Loads a map tile as raw image bytes.
      *
@@ -1263,13 +1514,17 @@ public interface OsmTileCoreInterface {
      * it downloads the tile from the configured tile server, saves it to cache,
      * and returns the image bytes. Do not call this from the UI thread.
      */
-    fun `loadTile`(`z`: kotlin.Long, `x`: kotlin.Long, `y`: kotlin.Long): kotlin.ByteArray
-    
+    fun `loadTile`(
+        `z`: kotlin.Long,
+        `x`: kotlin.Long,
+        `y`: kotlin.Long,
+    ): kotlin.ByteArray
+
     /**
      * Removes one marker from the Rust marker store.
      */
     fun `removeMarker`(`id`: kotlin.Long)
-    
+
     /**
      * Replaces all markers currently loaded into Rust.
      *
@@ -1277,12 +1532,12 @@ public interface OsmTileCoreInterface {
      * the working set after a new server query.
      */
     fun `replaceMarkers`(`markers`: List<MobileMarker>)
-    
+
     /**
      * Updates the current map viewport used by `visibleMarkers` and `clusteredMarkers`.
      */
     fun `setViewport`(`viewport`: MobileViewport)
-    
+
     /**
      * Adds or updates markers by id.
      *
@@ -1290,7 +1545,7 @@ public interface OsmTileCoreInterface {
      * from a backend. If the same id appears more than once, the last marker wins.
      */
     fun `upsertMarkers`(`markers`: List<MobileMarker>)
-    
+
     /**
      * Returns markers visible in the current viewport.
      *
@@ -1298,7 +1553,7 @@ public interface OsmTileCoreInterface {
      * for stable rendering.
      */
     fun `visibleMarkers`(): List<MobileMarker>
-    
+
     companion object
 }
 
@@ -1311,13 +1566,14 @@ public interface OsmTileCoreInterface {
  * background thread, coroutine dispatcher, or Swift task instead of the UI
  * thread.
  */
-open class OsmTileCore: Disposable, AutoCloseable, OsmTileCoreInterface
-{
-
-    @Suppress("UNUSED_PARAMETER")
+open class OsmTileEngine :
+    Disposable,
+    AutoCloseable,
+    OsmTileEngineInterface {
     /**
      * @suppress
      */
+    @Suppress("UNUSED_PARAMETER")
     constructor(withHandle: UniffiWithHandle, handle: Long) {
         this.handle = handle
         this.cleanable = UniffiLib.CLEANER.register(this, UniffiCleanAction(handle))
@@ -1335,6 +1591,7 @@ open class OsmTileCore: Disposable, AutoCloseable, OsmTileCoreInterface
         this.handle = 0
         this.cleanable = null
     }
+
     /**
      * Creates a tile engine with cache-first behavior.
      *
@@ -1343,13 +1600,16 @@ open class OsmTileCore: Disposable, AutoCloseable, OsmTileCoreInterface
      * emulator. `cache_dir` should be inside the app-private storage directory.
      */
     constructor(`tileUrlTemplate`: kotlin.String, `cacheDir`: kotlin.String) :
-        this(UniffiWithHandle, 
-    uniffiRustCallWithError(OsmTileCoreException) { _status ->
-    UniffiLib.uniffi_osm_tile_core_fn_constructor_osmtilecore_new(
-    
-        FfiConverterString.lower(`tileUrlTemplate`),FfiConverterString.lower(`cacheDir`),_status)
-}
-    )
+        this(
+            UniffiWithHandle,
+            uniffiRustCallWithError(OsmTileEngineException) { _status ->
+                UniffiLib.uniffi_osm_tile_engine_fn_constructor_osmtileengine_new(
+                    FfiConverterString.lower(`tileUrlTemplate`),
+                    FfiConverterString.lower(`cacheDir`),
+                    _status,
+                )
+            },
+        )
 
     protected val handle: Long
     protected val cleanable: UniffiCleaner.Cleanable?
@@ -1384,7 +1644,7 @@ open class OsmTileCore: Disposable, AutoCloseable, OsmTileCoreInterface
             if (c == Long.MAX_VALUE) {
                 throw IllegalStateException("${this.javaClass.simpleName} call counter would overflow")
             }
-        } while (! this.callCounter.compareAndSet(c, c + 1L))
+        } while (!this.callCounter.compareAndSet(c, c + 1L))
         // Now we can safely do the method call without the handle being freed concurrently.
         try {
             return block(this.uniffiCloneHandle())
@@ -1398,14 +1658,16 @@ open class OsmTileCore: Disposable, AutoCloseable, OsmTileCoreInterface
 
     // Use a static inner class instead of a closure so as not to accidentally
     // capture `this` as part of the cleanable's action.
-    private class UniffiCleanAction(private val handle: Long) : Runnable {
+    private class UniffiCleanAction(
+        private val handle: Long,
+    ) : Runnable {
         override fun run() {
             if (handle == 0.toLong()) {
                 // Fake object created with `NoHandle`, don't try to free.
-                return;
+                return
             }
             uniffiRustCall { status ->
-                UniffiLib.uniffi_osm_tile_core_fn_free_osmtilecore(handle, status)
+                UniffiLib.uniffi_osm_tile_engine_fn_free_osmtileengine(handle, status)
             }
         }
     }
@@ -1415,70 +1677,66 @@ open class OsmTileCore: Disposable, AutoCloseable, OsmTileCoreInterface
      */
     fun uniffiCloneHandle(): Long {
         if (handle == 0.toLong()) {
-            throw InternalException("uniffiCloneHandle() called on NoHandle object");
+            throw InternalException("uniffiCloneHandle() called on NoHandle object")
         }
-        return uniffiRustCall() { status ->
-            UniffiLib.uniffi_osm_tile_core_fn_clone_osmtilecore(handle, status)
+        return uniffiRustCall { status ->
+            UniffiLib.uniffi_osm_tile_engine_fn_clone_osmtileengine(handle, status)
         }
     }
 
-    
     /**
      * Clears all markers from the Rust marker store.
      */
-    @Throws(OsmTileCoreException::class)override fun `clearMarkers`()
-        = 
-    callWithHandle {
-    uniffiRustCallWithError(OsmTileCoreException) { _status ->
-    UniffiLib.uniffi_osm_tile_core_fn_method_osmtilecore_clear_markers(
-        it,
-        _status)
-}
-    }
-    
-    
+    @Throws(OsmTileEngineException::class)
+    override fun `clearMarkers`() =
+        callWithHandle {
+            uniffiRustCallWithError(OsmTileEngineException) { _status ->
+                UniffiLib.uniffi_osm_tile_engine_fn_method_osmtileengine_clear_markers(
+                    it,
+                    _status,
+                )
+            }
+        }
 
-    
     /**
      * Clusters every marker loaded into Rust for the given zoom.
      *
      * This ignores the current viewport but still respects each marker's zoom
      * visibility range.
      */
-    @Throws(OsmTileCoreException::class)override fun `clusteredAll`(`zoom`: kotlin.Long): List<MobileMarkerRenderItem> {
-            return FfiConverterSequenceTypeMobileMarkerRenderItem.lift(
-    callWithHandle {
-    uniffiRustCallWithError(OsmTileCoreException) { _status ->
-    UniffiLib.uniffi_osm_tile_core_fn_method_osmtilecore_clustered_all(
-        it,
-        FfiConverterLong.lower(`zoom`),_status)
-}
-    }
-    )
-    }
-    
+    @Throws(OsmTileEngineException::class)
+    override fun `clusteredAll`(`zoom`: kotlin.Long): List<MobileMarkerRenderItem> =
+        FfiConverterSequenceTypeMobileMarkerRenderItem.lift(
+            callWithHandle {
+                uniffiRustCallWithError(OsmTileEngineException) { _status ->
+                    UniffiLib.uniffi_osm_tile_engine_fn_method_osmtileengine_clustered_all(
+                        it,
+                        FfiConverterLong.lower(`zoom`),
+                        _status,
+                    )
+                }
+            },
+        )
 
-    
     /**
      * Returns marker and cluster render items visible in the current viewport.
      *
      * Rust performs simple grid-based clustering in WebMercator pixel space.
      * The UI should render markers and clusters using its own icons and views.
      */
-    @Throws(OsmTileCoreException::class)override fun `clusteredMarkers`(): List<MobileMarkerRenderItem> {
-            return FfiConverterSequenceTypeMobileMarkerRenderItem.lift(
-    callWithHandle {
-    uniffiRustCallWithError(OsmTileCoreException) { _status ->
-    UniffiLib.uniffi_osm_tile_core_fn_method_osmtilecore_clustered_markers(
-        it,
-        _status)
-}
-    }
-    )
-    }
-    
+    @Throws(OsmTileEngineException::class)
+    override fun `clusteredMarkers`(): List<MobileMarkerRenderItem> =
+        FfiConverterSequenceTypeMobileMarkerRenderItem.lift(
+            callWithHandle {
+                uniffiRustCallWithError(OsmTileEngineException) { _status ->
+                    UniffiLib.uniffi_osm_tile_engine_fn_method_osmtileengine_clustered_markers(
+                        it,
+                        _status,
+                    )
+                }
+            },
+        )
 
-    
     /**
      * Loads a map tile as raw image bytes.
      *
@@ -1486,148 +1744,136 @@ open class OsmTileCore: Disposable, AutoCloseable, OsmTileCoreInterface
      * it downloads the tile from the configured tile server, saves it to cache,
      * and returns the image bytes. Do not call this from the UI thread.
      */
-    @Throws(OsmTileCoreException::class)override fun `loadTile`(`z`: kotlin.Long, `x`: kotlin.Long, `y`: kotlin.Long): kotlin.ByteArray {
-            return FfiConverterByteArray.lift(
-    callWithHandle {
-    uniffiRustCallWithError(OsmTileCoreException) { _status ->
-    UniffiLib.uniffi_osm_tile_core_fn_method_osmtilecore_load_tile(
-        it,
-        FfiConverterLong.lower(`z`),FfiConverterLong.lower(`x`),FfiConverterLong.lower(`y`),_status)
-}
-    }
-    )
-    }
-    
+    @Throws(OsmTileEngineException::class)
+    override fun `loadTile`(
+        `z`: kotlin.Long,
+        `x`: kotlin.Long,
+        `y`: kotlin.Long,
+    ): kotlin.ByteArray =
+        FfiConverterByteArray.lift(
+            callWithHandle {
+                uniffiRustCallWithError(OsmTileEngineException) { _status ->
+                    UniffiLib.uniffi_osm_tile_engine_fn_method_osmtileengine_load_tile(
+                        it,
+                        FfiConverterLong.lower(`z`),
+                        FfiConverterLong.lower(`x`),
+                        FfiConverterLong.lower(`y`),
+                        _status,
+                    )
+                }
+            },
+        )
 
-    
     /**
      * Removes one marker from the Rust marker store.
      */
-    @Throws(OsmTileCoreException::class)override fun `removeMarker`(`id`: kotlin.Long)
-        = 
-    callWithHandle {
-    uniffiRustCallWithError(OsmTileCoreException) { _status ->
-    UniffiLib.uniffi_osm_tile_core_fn_method_osmtilecore_remove_marker(
-        it,
-        FfiConverterLong.lower(`id`),_status)
-}
-    }
-    
-    
+    @Throws(OsmTileEngineException::class)
+    override fun `removeMarker`(`id`: kotlin.Long) =
+        callWithHandle {
+            uniffiRustCallWithError(OsmTileEngineException) { _status ->
+                UniffiLib.uniffi_osm_tile_engine_fn_method_osmtileengine_remove_marker(
+                    it,
+                    FfiConverterLong.lower(`id`),
+                    _status,
+                )
+            }
+        }
 
-    
     /**
      * Replaces all markers currently loaded into Rust.
      *
      * Use this when the app has a complete offline marker set or wants to reset
      * the working set after a new server query.
      */
-    @Throws(OsmTileCoreException::class)override fun `replaceMarkers`(`markers`: List<MobileMarker>)
-        = 
-    callWithHandle {
-    uniffiRustCallWithError(OsmTileCoreException) { _status ->
-    UniffiLib.uniffi_osm_tile_core_fn_method_osmtilecore_replace_markers(
-        it,
-        FfiConverterSequenceTypeMobileMarker.lower(`markers`),_status)
-}
-    }
-    
-    
+    @Throws(OsmTileEngineException::class)
+    override fun `replaceMarkers`(`markers`: List<MobileMarker>) =
+        callWithHandle {
+            uniffiRustCallWithError(OsmTileEngineException) { _status ->
+                UniffiLib.uniffi_osm_tile_engine_fn_method_osmtileengine_replace_markers(
+                    it,
+                    FfiConverterSequenceTypeMobileMarker.lower(`markers`),
+                    _status,
+                )
+            }
+        }
 
-    
     /**
      * Updates the current map viewport used by `visibleMarkers` and `clusteredMarkers`.
      */
-    @Throws(OsmTileCoreException::class)override fun `setViewport`(`viewport`: MobileViewport)
-        = 
-    callWithHandle {
-    uniffiRustCallWithError(OsmTileCoreException) { _status ->
-    UniffiLib.uniffi_osm_tile_core_fn_method_osmtilecore_set_viewport(
-        it,
-        FfiConverterTypeMobileViewport.lower(`viewport`),_status)
-}
-    }
-    
-    
+    @Throws(OsmTileEngineException::class)
+    override fun `setViewport`(`viewport`: MobileViewport) =
+        callWithHandle {
+            uniffiRustCallWithError(OsmTileEngineException) { _status ->
+                UniffiLib.uniffi_osm_tile_engine_fn_method_osmtileengine_set_viewport(
+                    it,
+                    FfiConverterTypeMobileViewport.lower(`viewport`),
+                    _status,
+                )
+            }
+        }
 
-    
     /**
      * Adds or updates markers by id.
      *
      * This is useful when the app loads markers page-by-page or bbox-by-bbox
      * from a backend. If the same id appears more than once, the last marker wins.
      */
-    @Throws(OsmTileCoreException::class)override fun `upsertMarkers`(`markers`: List<MobileMarker>)
-        = 
-    callWithHandle {
-    uniffiRustCallWithError(OsmTileCoreException) { _status ->
-    UniffiLib.uniffi_osm_tile_core_fn_method_osmtilecore_upsert_markers(
-        it,
-        FfiConverterSequenceTypeMobileMarker.lower(`markers`),_status)
-}
-    }
-    
-    
+    @Throws(OsmTileEngineException::class)
+    override fun `upsertMarkers`(`markers`: List<MobileMarker>) =
+        callWithHandle {
+            uniffiRustCallWithError(OsmTileEngineException) { _status ->
+                UniffiLib.uniffi_osm_tile_engine_fn_method_osmtileengine_upsert_markers(
+                    it,
+                    FfiConverterSequenceTypeMobileMarker.lower(`markers`),
+                    _status,
+                )
+            }
+        }
 
-    
     /**
      * Returns markers visible in the current viewport.
      *
      * The result is filtered by bbox and marker zoom range, then sorted by id
      * for stable rendering.
      */
-    @Throws(OsmTileCoreException::class)override fun `visibleMarkers`(): List<MobileMarker> {
-            return FfiConverterSequenceTypeMobileMarker.lift(
-    callWithHandle {
-    uniffiRustCallWithError(OsmTileCoreException) { _status ->
-    UniffiLib.uniffi_osm_tile_core_fn_method_osmtilecore_visible_markers(
-        it,
-        _status)
-}
-    }
-    )
-    }
-    
+    @Throws(OsmTileEngineException::class)
+    override fun `visibleMarkers`(): List<MobileMarker> =
+        FfiConverterSequenceTypeMobileMarker.lift(
+            callWithHandle {
+                uniffiRustCallWithError(OsmTileEngineException) { _status ->
+                    UniffiLib.uniffi_osm_tile_engine_fn_method_osmtileengine_visible_markers(
+                        it,
+                        _status,
+                    )
+                }
+            },
+        )
 
-    
-
-    
-
-
-    
-    
     /**
      * @suppress
      */
     companion object
-    
 }
-
 
 /**
  * @suppress
  */
-public object FfiConverterTypeOsmTileCore: FfiConverter<OsmTileCore, Long> {
-    override fun lower(value: OsmTileCore): Long {
-        return value.uniffiCloneHandle()
-    }
+public object FfiConverterTypeOsmTileEngine : FfiConverter<OsmTileEngine, Long> {
+    override fun lower(value: OsmTileEngine): Long = value.uniffiCloneHandle()
 
-    override fun lift(value: Long): OsmTileCore {
-        return OsmTileCore(UniffiWithHandle, value)
-    }
+    override fun lift(value: Long): OsmTileEngine = OsmTileEngine(UniffiWithHandle, value)
 
-    override fun read(buf: ByteBuffer): OsmTileCore {
-        return lift(buf.getLong())
-    }
+    override fun read(buf: ByteBuffer): OsmTileEngine = lift(buf.getLong())
 
-    override fun allocationSize(value: OsmTileCore) = 8UL
+    override fun allocationSize(value: OsmTileEngine) = 8UL
 
-    override fun write(value: OsmTileCore, buf: ByteBuffer) {
+    override fun write(
+        value: OsmTileEngine,
+        buf: ByteBuffer,
+    ) {
         buf.putLong(lower(value))
     }
 }
-
-
 
 /**
  * A point marker known to the Rust core.
@@ -1636,52 +1882,41 @@ public object FfiConverterTypeOsmTileCore: FfiConverter<OsmTileCore, Long> {
  * and zoom visibility so it can return only the markers relevant to the
  * current viewport.
  */
-data class MobileMarker (
+data class MobileMarker(
     /**
      * Stable marker id. Use the same id when updating a marker with `upsertMarkers`.
      */
-    val `id`: kotlin.Long
-    , 
+    val `id`: kotlin.Long,
     /**
      * Marker latitude in `-90..=90`.
      */
-    val `lat`: kotlin.Double
-    , 
+    val `lat`: kotlin.Double,
     /**
      * Marker longitude in `-180..=180`.
      */
-    val `lon`: kotlin.Double
-    , 
+    val `lon`: kotlin.Double,
     /**
      * Domain-specific marker category, for example `cafe`, `hotel`, or `vehicle`.
      */
-    val `kind`: kotlin.String
-    , 
+    val `kind`: kotlin.String,
     /**
      * First zoom level where this marker should be visible.
      */
-    val `minZoom`: kotlin.Long
-    , 
+    val `minZoom`: kotlin.Long,
     /**
      * Last zoom level where this marker should be visible.
      */
-    val `maxZoom`: kotlin.Long
-    
-){
-    
-
-    
-
-    
+    val `maxZoom`: kotlin.Long,
+) {
     companion object
 }
 
 /**
  * @suppress
  */
-public object FfiConverterTypeMobileMarker: FfiConverterRustBuffer<MobileMarker> {
-    override fun read(buf: ByteBuffer): MobileMarker {
-        return MobileMarker(
+public object FfiConverterTypeMobileMarker : FfiConverterRustBuffer<MobileMarker> {
+    override fun read(buf: ByteBuffer): MobileMarker =
+        MobileMarker(
             FfiConverterLong.read(buf),
             FfiConverterDouble.read(buf),
             FfiConverterDouble.read(buf),
@@ -1689,28 +1924,29 @@ public object FfiConverterTypeMobileMarker: FfiConverterRustBuffer<MobileMarker>
             FfiConverterLong.read(buf),
             FfiConverterLong.read(buf),
         )
-    }
 
-    override fun allocationSize(value: MobileMarker) = (
+    override fun allocationSize(value: MobileMarker) =
+        (
             FfiConverterLong.allocationSize(value.`id`) +
-            FfiConverterDouble.allocationSize(value.`lat`) +
-            FfiConverterDouble.allocationSize(value.`lon`) +
-            FfiConverterString.allocationSize(value.`kind`) +
-            FfiConverterLong.allocationSize(value.`minZoom`) +
-            FfiConverterLong.allocationSize(value.`maxZoom`)
-    )
+                FfiConverterDouble.allocationSize(value.`lat`) +
+                FfiConverterDouble.allocationSize(value.`lon`) +
+                FfiConverterString.allocationSize(value.`kind`) +
+                FfiConverterLong.allocationSize(value.`minZoom`) +
+                FfiConverterLong.allocationSize(value.`maxZoom`)
+        )
 
-    override fun write(value: MobileMarker, buf: ByteBuffer) {
-            FfiConverterLong.write(value.`id`, buf)
-            FfiConverterDouble.write(value.`lat`, buf)
-            FfiConverterDouble.write(value.`lon`, buf)
-            FfiConverterString.write(value.`kind`, buf)
-            FfiConverterLong.write(value.`minZoom`, buf)
-            FfiConverterLong.write(value.`maxZoom`, buf)
+    override fun write(
+        value: MobileMarker,
+        buf: ByteBuffer,
+    ) {
+        FfiConverterLong.write(value.`id`, buf)
+        FfiConverterDouble.write(value.`lat`, buf)
+        FfiConverterDouble.write(value.`lon`, buf)
+        FfiConverterString.write(value.`kind`, buf)
+        FfiConverterLong.write(value.`minZoom`, buf)
+        FfiConverterLong.write(value.`maxZoom`, buf)
     }
 }
-
-
 
 /**
  * A cluster returned by Rust for rendering on the current map.
@@ -1718,73 +1954,64 @@ public object FfiConverterTypeMobileMarker: FfiConverterRustBuffer<MobileMarker>
  * The cluster coordinate is the average coordinate of all markers in the
  * cluster. The mobile UI decides which icon, text, and interaction to use.
  */
-data class MobileMarkerCluster (
+data class MobileMarkerCluster(
     /**
      * Stable cluster id for the current zoom/grid cell.
      */
-    val `id`: kotlin.String
-    , 
+    val `id`: kotlin.String,
     /**
      * Cluster latitude.
      */
-    val `lat`: kotlin.Double
-    , 
+    val `lat`: kotlin.Double,
     /**
      * Cluster longitude.
      */
-    val `lon`: kotlin.Double
-    , 
+    val `lon`: kotlin.Double,
     /**
      * Number of markers represented by this cluster.
      */
-    val `count`: kotlin.Long
-    , 
+    val `count`: kotlin.Long,
     /**
      * Marker ids included in the cluster.
      */
-    val `markerIds`: List<kotlin.Long>
-    
-){
-    
-
-    
-
-    
+    val `markerIds`: List<kotlin.Long>,
+) {
     companion object
 }
 
 /**
  * @suppress
  */
-public object FfiConverterTypeMobileMarkerCluster: FfiConverterRustBuffer<MobileMarkerCluster> {
-    override fun read(buf: ByteBuffer): MobileMarkerCluster {
-        return MobileMarkerCluster(
+public object FfiConverterTypeMobileMarkerCluster : FfiConverterRustBuffer<MobileMarkerCluster> {
+    override fun read(buf: ByteBuffer): MobileMarkerCluster =
+        MobileMarkerCluster(
             FfiConverterString.read(buf),
             FfiConverterDouble.read(buf),
             FfiConverterDouble.read(buf),
             FfiConverterLong.read(buf),
             FfiConverterSequenceLong.read(buf),
         )
-    }
 
-    override fun allocationSize(value: MobileMarkerCluster) = (
+    override fun allocationSize(value: MobileMarkerCluster) =
+        (
             FfiConverterString.allocationSize(value.`id`) +
-            FfiConverterDouble.allocationSize(value.`lat`) +
-            FfiConverterDouble.allocationSize(value.`lon`) +
-            FfiConverterLong.allocationSize(value.`count`) +
-            FfiConverterSequenceLong.allocationSize(value.`markerIds`)
-    )
+                FfiConverterDouble.allocationSize(value.`lat`) +
+                FfiConverterDouble.allocationSize(value.`lon`) +
+                FfiConverterLong.allocationSize(value.`count`) +
+                FfiConverterSequenceLong.allocationSize(value.`markerIds`)
+        )
 
-    override fun write(value: MobileMarkerCluster, buf: ByteBuffer) {
-            FfiConverterString.write(value.`id`, buf)
-            FfiConverterDouble.write(value.`lat`, buf)
-            FfiConverterDouble.write(value.`lon`, buf)
-            FfiConverterLong.write(value.`count`, buf)
-            FfiConverterSequenceLong.write(value.`markerIds`, buf)
+    override fun write(
+        value: MobileMarkerCluster,
+        buf: ByteBuffer,
+    ) {
+        FfiConverterString.write(value.`id`, buf)
+        FfiConverterDouble.write(value.`lat`, buf)
+        FfiConverterDouble.write(value.`lon`, buf)
+        FfiConverterLong.write(value.`count`, buf)
+        FfiConverterSequenceLong.write(value.`markerIds`, buf)
     }
 }
-
-
 
 /**
  * A render item returned by `clusteredMarkers` or `clusteredAll`.
@@ -1792,57 +2019,50 @@ public object FfiConverterTypeMobileMarkerCluster: FfiConverterRustBuffer<Mobile
  * UniFFI records are simpler for Kotlin and Swift when the shape is stable, so
  * this type uses `item_type` plus optional `marker`/`cluster` payloads.
  */
-data class MobileMarkerRenderItem (
+data class MobileMarkerRenderItem(
     /**
      * Tells the UI which payload field to read.
      */
-    val `itemType`: MobileRenderItemType
-    , 
+    val `itemType`: MobileRenderItemType,
     /**
      * Present when `item_type == Marker`.
      */
-    val `marker`: MobileMarker?
-    , 
+    val `marker`: MobileMarker?,
     /**
      * Present when `item_type == Cluster`.
      */
-    val `cluster`: MobileMarkerCluster?
-    
-){
-    
-
-    
-
-    
+    val `cluster`: MobileMarkerCluster?,
+) {
     companion object
 }
 
 /**
  * @suppress
  */
-public object FfiConverterTypeMobileMarkerRenderItem: FfiConverterRustBuffer<MobileMarkerRenderItem> {
-    override fun read(buf: ByteBuffer): MobileMarkerRenderItem {
-        return MobileMarkerRenderItem(
+public object FfiConverterTypeMobileMarkerRenderItem : FfiConverterRustBuffer<MobileMarkerRenderItem> {
+    override fun read(buf: ByteBuffer): MobileMarkerRenderItem =
+        MobileMarkerRenderItem(
             FfiConverterTypeMobileRenderItemType.read(buf),
             FfiConverterOptionalTypeMobileMarker.read(buf),
             FfiConverterOptionalTypeMobileMarkerCluster.read(buf),
         )
-    }
 
-    override fun allocationSize(value: MobileMarkerRenderItem) = (
+    override fun allocationSize(value: MobileMarkerRenderItem) =
+        (
             FfiConverterTypeMobileRenderItemType.allocationSize(value.`itemType`) +
-            FfiConverterOptionalTypeMobileMarker.allocationSize(value.`marker`) +
-            FfiConverterOptionalTypeMobileMarkerCluster.allocationSize(value.`cluster`)
-    )
+                FfiConverterOptionalTypeMobileMarker.allocationSize(value.`marker`) +
+                FfiConverterOptionalTypeMobileMarkerCluster.allocationSize(value.`cluster`)
+        )
 
-    override fun write(value: MobileMarkerRenderItem, buf: ByteBuffer) {
-            FfiConverterTypeMobileRenderItemType.write(value.`itemType`, buf)
-            FfiConverterOptionalTypeMobileMarker.write(value.`marker`, buf)
-            FfiConverterOptionalTypeMobileMarkerCluster.write(value.`cluster`, buf)
+    override fun write(
+        value: MobileMarkerRenderItem,
+        buf: ByteBuffer,
+    ) {
+        FfiConverterTypeMobileRenderItemType.write(value.`itemType`, buf)
+        FfiConverterOptionalTypeMobileMarker.write(value.`marker`, buf)
+        FfiConverterOptionalTypeMobileMarkerCluster.write(value.`cluster`, buf)
     }
 }
-
-
 
 /**
  * The currently visible map rectangle and zoom level.
@@ -1850,266 +2070,257 @@ public object FfiConverterTypeMobileMarkerRenderItem: FfiConverterRustBuffer<Mob
  * Pass this from Android or iOS whenever the map camera changes enough that
  * visible markers or clusters should be recalculated.
  */
-data class MobileViewport (
+data class MobileViewport(
     /**
      * Southern latitude of the visible map area.
      */
-    val `south`: kotlin.Double
-    , 
+    val `south`: kotlin.Double,
     /**
      * Western longitude of the visible map area.
      *
      * If `west > east`, the bounds cross the antimeridian.
      */
-    val `west`: kotlin.Double
-    , 
+    val `west`: kotlin.Double,
     /**
      * Northern latitude of the visible map area.
      */
-    val `north`: kotlin.Double
-    , 
+    val `north`: kotlin.Double,
     /**
      * Eastern longitude of the visible map area.
      */
-    val `east`: kotlin.Double
-    , 
+    val `east`: kotlin.Double,
     /**
      * Integer map zoom. The supported range is `0..=30`.
      */
-    val `zoom`: kotlin.Long
-    
-){
-    
-
-    
-
-    
+    val `zoom`: kotlin.Long,
+) {
     companion object
 }
 
 /**
  * @suppress
  */
-public object FfiConverterTypeMobileViewport: FfiConverterRustBuffer<MobileViewport> {
-    override fun read(buf: ByteBuffer): MobileViewport {
-        return MobileViewport(
+public object FfiConverterTypeMobileViewport : FfiConverterRustBuffer<MobileViewport> {
+    override fun read(buf: ByteBuffer): MobileViewport =
+        MobileViewport(
             FfiConverterDouble.read(buf),
             FfiConverterDouble.read(buf),
             FfiConverterDouble.read(buf),
             FfiConverterDouble.read(buf),
             FfiConverterLong.read(buf),
         )
-    }
 
-    override fun allocationSize(value: MobileViewport) = (
+    override fun allocationSize(value: MobileViewport) =
+        (
             FfiConverterDouble.allocationSize(value.`south`) +
-            FfiConverterDouble.allocationSize(value.`west`) +
-            FfiConverterDouble.allocationSize(value.`north`) +
-            FfiConverterDouble.allocationSize(value.`east`) +
-            FfiConverterLong.allocationSize(value.`zoom`)
-    )
+                FfiConverterDouble.allocationSize(value.`west`) +
+                FfiConverterDouble.allocationSize(value.`north`) +
+                FfiConverterDouble.allocationSize(value.`east`) +
+                FfiConverterLong.allocationSize(value.`zoom`)
+        )
 
-    override fun write(value: MobileViewport, buf: ByteBuffer) {
-            FfiConverterDouble.write(value.`south`, buf)
-            FfiConverterDouble.write(value.`west`, buf)
-            FfiConverterDouble.write(value.`north`, buf)
-            FfiConverterDouble.write(value.`east`, buf)
-            FfiConverterLong.write(value.`zoom`, buf)
+    override fun write(
+        value: MobileViewport,
+        buf: ByteBuffer,
+    ) {
+        FfiConverterDouble.write(value.`south`, buf)
+        FfiConverterDouble.write(value.`west`, buf)
+        FfiConverterDouble.write(value.`north`, buf)
+        FfiConverterDouble.write(value.`east`, buf)
+        FfiConverterLong.write(value.`zoom`, buf)
     }
 }
-
-
 
 /**
  * Identifies which optional payload is present in `MobileMarkerRenderItem`.
  */
 
 enum class MobileRenderItemType {
-    
     /**
      * `marker` is present and `cluster` is empty.
      */
     MARKER,
+
     /**
      * `cluster` is present and `marker` is empty.
      */
-    CLUSTER;
+    CLUSTER,
 
-    
-
+    ;
 
     companion object
 }
 
-
 /**
  * @suppress
  */
-public object FfiConverterTypeMobileRenderItemType: FfiConverterRustBuffer<MobileRenderItemType> {
-    override fun read(buf: ByteBuffer) = try {
-        MobileRenderItemType.values()[buf.getInt() - 1]
-    } catch (e: IndexOutOfBoundsException) {
-        throw RuntimeException("invalid enum value, something is very wrong!!", e)
-    }
+public object FfiConverterTypeMobileRenderItemType : FfiConverterRustBuffer<MobileRenderItemType> {
+    override fun read(buf: ByteBuffer) =
+        try {
+            MobileRenderItemType.values()[buf.getInt() - 1]
+        } catch (e: IndexOutOfBoundsException) {
+            throw RuntimeException("invalid enum value, something is very wrong!!", e)
+        }
 
     override fun allocationSize(value: MobileRenderItemType) = 4UL
 
-    override fun write(value: MobileRenderItemType, buf: ByteBuffer) {
+    override fun write(
+        value: MobileRenderItemType,
+        buf: ByteBuffer,
+    ) {
         buf.putInt(value.ordinal + 1)
     }
 }
-
-
-
-
-
-
 
 /**
  * Error type exposed to Kotlin and Swift callers.
  *
  * The `details` field is safe to display in logs and developer diagnostics.
  */
-sealed class OsmTileCoreException: kotlin.Exception() {
-    
+sealed class OsmTileEngineException : kotlin.Exception() {
     /**
      * The caller passed invalid coordinates, zoom, ids, or URL template.
      */
     class InvalidInput(
-        
-        val `details`: kotlin.String
-        ) : OsmTileCoreException() {
+        val `details`: kotlin.String,
+    ) : OsmTileEngineException() {
         override val message
             get() = "details=${ `details` }"
     }
-    
+
     /**
      * The tile cache could not read or write local files.
      */
     class Cache(
-        
-        val `details`: kotlin.String
-        ) : OsmTileCoreException() {
+        val `details`: kotlin.String,
+    ) : OsmTileEngineException() {
         override val message
             get() = "details=${ `details` }"
     }
-    
+
     /**
      * The tile server request failed or returned a non-success HTTP status.
      */
     class Network(
-        
-        val `details`: kotlin.String
-        ) : OsmTileCoreException() {
+        val `details`: kotlin.String,
+    ) : OsmTileEngineException() {
         override val message
             get() = "details=${ `details` }"
     }
-    
+
     /**
      * The map state is not ready for the requested operation.
      */
     class State(
-        
-        val `details`: kotlin.String
-        ) : OsmTileCoreException() {
+        val `details`: kotlin.String,
+    ) : OsmTileEngineException() {
         override val message
             get() = "details=${ `details` }"
     }
-    
 
-    
-
-
-    companion object ErrorHandler : UniffiRustCallStatusErrorHandler<OsmTileCoreException> {
-        override fun lift(error_buf: RustBuffer.ByValue): OsmTileCoreException = FfiConverterTypeOsmTileCoreError.lift(error_buf)
+    companion object ErrorHandler : UniffiRustCallStatusErrorHandler<OsmTileEngineException> {
+        override fun lift(error_buf: RustBuffer.ByValue): OsmTileEngineException = FfiConverterTypeOsmTileEngineError.lift(error_buf)
     }
-
-    
 }
 
 /**
  * @suppress
  */
-public object FfiConverterTypeOsmTileCoreError : FfiConverterRustBuffer<OsmTileCoreException> {
-    override fun read(buf: ByteBuffer): OsmTileCoreException {
-        
+public object FfiConverterTypeOsmTileEngineError : FfiConverterRustBuffer<OsmTileEngineException> {
+    override fun read(buf: ByteBuffer): OsmTileEngineException =
+        when (buf.getInt()) {
+            1 -> {
+                OsmTileEngineException.InvalidInput(
+                    FfiConverterString.read(buf),
+                )
+            }
 
-        return when(buf.getInt()) {
-            1 -> OsmTileCoreException.InvalidInput(
-                FfiConverterString.read(buf),
+            2 -> {
+                OsmTileEngineException.Cache(
+                    FfiConverterString.read(buf),
                 )
-            2 -> OsmTileCoreException.Cache(
-                FfiConverterString.read(buf),
+            }
+
+            3 -> {
+                OsmTileEngineException.Network(
+                    FfiConverterString.read(buf),
                 )
-            3 -> OsmTileCoreException.Network(
-                FfiConverterString.read(buf),
+            }
+
+            4 -> {
+                OsmTileEngineException.State(
+                    FfiConverterString.read(buf),
                 )
-            4 -> OsmTileCoreException.State(
-                FfiConverterString.read(buf),
-                )
-            else -> throw RuntimeException("invalid error enum value, something is very wrong!!")
+            }
+
+            else -> {
+                throw RuntimeException("invalid error enum value, something is very wrong!!")
+            }
         }
-    }
 
-    override fun allocationSize(value: OsmTileCoreException): ULong {
-        return when(value) {
-            is OsmTileCoreException.InvalidInput -> (
+    override fun allocationSize(value: OsmTileEngineException): ULong =
+        when (value) {
+            is OsmTileEngineException.InvalidInput -> (
                 // Add the size for the Int that specifies the variant plus the size needed for all fields
-                4UL
-                + FfiConverterString.allocationSize(value.`details`)
+                4UL +
+                    FfiConverterString.allocationSize(value.`details`)
             )
-            is OsmTileCoreException.Cache -> (
+
+            is OsmTileEngineException.Cache -> (
                 // Add the size for the Int that specifies the variant plus the size needed for all fields
-                4UL
-                + FfiConverterString.allocationSize(value.`details`)
+                4UL +
+                    FfiConverterString.allocationSize(value.`details`)
             )
-            is OsmTileCoreException.Network -> (
+
+            is OsmTileEngineException.Network -> (
                 // Add the size for the Int that specifies the variant plus the size needed for all fields
-                4UL
-                + FfiConverterString.allocationSize(value.`details`)
+                4UL +
+                    FfiConverterString.allocationSize(value.`details`)
             )
-            is OsmTileCoreException.State -> (
+
+            is OsmTileEngineException.State -> (
                 // Add the size for the Int that specifies the variant plus the size needed for all fields
-                4UL
-                + FfiConverterString.allocationSize(value.`details`)
+                4UL +
+                    FfiConverterString.allocationSize(value.`details`)
             )
         }
-    }
 
-    override fun write(value: OsmTileCoreException, buf: ByteBuffer) {
-        when(value) {
-            is OsmTileCoreException.InvalidInput -> {
+    override fun write(
+        value: OsmTileEngineException,
+        buf: ByteBuffer,
+    ) {
+        when (value) {
+            is OsmTileEngineException.InvalidInput -> {
                 buf.putInt(1)
                 FfiConverterString.write(value.`details`, buf)
                 Unit
             }
-            is OsmTileCoreException.Cache -> {
+
+            is OsmTileEngineException.Cache -> {
                 buf.putInt(2)
                 FfiConverterString.write(value.`details`, buf)
                 Unit
             }
-            is OsmTileCoreException.Network -> {
+
+            is OsmTileEngineException.Network -> {
                 buf.putInt(3)
                 FfiConverterString.write(value.`details`, buf)
                 Unit
             }
-            is OsmTileCoreException.State -> {
+
+            is OsmTileEngineException.State -> {
                 buf.putInt(4)
                 FfiConverterString.write(value.`details`, buf)
                 Unit
             }
         }.let { /* this makes the `when` an expression, which ensures it is exhaustive */ }
     }
-
 }
-
-
-
 
 /**
  * @suppress
  */
-public object FfiConverterOptionalTypeMobileMarker: FfiConverterRustBuffer<MobileMarker?> {
+public object FfiConverterOptionalTypeMobileMarker : FfiConverterRustBuffer<MobileMarker?> {
     override fun read(buf: ByteBuffer): MobileMarker? {
         if (buf.get().toInt() == 0) {
             return null
@@ -2125,7 +2336,10 @@ public object FfiConverterOptionalTypeMobileMarker: FfiConverterRustBuffer<Mobil
         }
     }
 
-    override fun write(value: MobileMarker?, buf: ByteBuffer) {
+    override fun write(
+        value: MobileMarker?,
+        buf: ByteBuffer,
+    ) {
         if (value == null) {
             buf.put(0)
         } else {
@@ -2135,13 +2349,10 @@ public object FfiConverterOptionalTypeMobileMarker: FfiConverterRustBuffer<Mobil
     }
 }
 
-
-
-
 /**
  * @suppress
  */
-public object FfiConverterOptionalTypeMobileMarkerCluster: FfiConverterRustBuffer<MobileMarkerCluster?> {
+public object FfiConverterOptionalTypeMobileMarkerCluster : FfiConverterRustBuffer<MobileMarkerCluster?> {
     override fun read(buf: ByteBuffer): MobileMarkerCluster? {
         if (buf.get().toInt() == 0) {
             return null
@@ -2157,7 +2368,10 @@ public object FfiConverterOptionalTypeMobileMarkerCluster: FfiConverterRustBuffe
         }
     }
 
-    override fun write(value: MobileMarkerCluster?, buf: ByteBuffer) {
+    override fun write(
+        value: MobileMarkerCluster?,
+        buf: ByteBuffer,
+    ) {
         if (value == null) {
             buf.put(0)
         } else {
@@ -2167,13 +2381,10 @@ public object FfiConverterOptionalTypeMobileMarkerCluster: FfiConverterRustBuffe
     }
 }
 
-
-
-
 /**
  * @suppress
  */
-public object FfiConverterSequenceLong: FfiConverterRustBuffer<List<kotlin.Long>> {
+public object FfiConverterSequenceLong : FfiConverterRustBuffer<List<kotlin.Long>> {
     override fun read(buf: ByteBuffer): List<kotlin.Long> {
         val len = buf.getInt()
         return List<kotlin.Long>(len) {
@@ -2187,7 +2398,10 @@ public object FfiConverterSequenceLong: FfiConverterRustBuffer<List<kotlin.Long>
         return sizeForLength + sizeForItems
     }
 
-    override fun write(value: List<kotlin.Long>, buf: ByteBuffer) {
+    override fun write(
+        value: List<kotlin.Long>,
+        buf: ByteBuffer,
+    ) {
         buf.putInt(value.size)
         value.iterator().forEach {
             FfiConverterLong.write(it, buf)
@@ -2195,13 +2409,10 @@ public object FfiConverterSequenceLong: FfiConverterRustBuffer<List<kotlin.Long>
     }
 }
 
-
-
-
 /**
  * @suppress
  */
-public object FfiConverterSequenceTypeMobileMarker: FfiConverterRustBuffer<List<MobileMarker>> {
+public object FfiConverterSequenceTypeMobileMarker : FfiConverterRustBuffer<List<MobileMarker>> {
     override fun read(buf: ByteBuffer): List<MobileMarker> {
         val len = buf.getInt()
         return List<MobileMarker>(len) {
@@ -2215,7 +2426,10 @@ public object FfiConverterSequenceTypeMobileMarker: FfiConverterRustBuffer<List<
         return sizeForLength + sizeForItems
     }
 
-    override fun write(value: List<MobileMarker>, buf: ByteBuffer) {
+    override fun write(
+        value: List<MobileMarker>,
+        buf: ByteBuffer,
+    ) {
         buf.putInt(value.size)
         value.iterator().forEach {
             FfiConverterTypeMobileMarker.write(it, buf)
@@ -2223,13 +2437,10 @@ public object FfiConverterSequenceTypeMobileMarker: FfiConverterRustBuffer<List<
     }
 }
 
-
-
-
 /**
  * @suppress
  */
-public object FfiConverterSequenceTypeMobileMarkerRenderItem: FfiConverterRustBuffer<List<MobileMarkerRenderItem>> {
+public object FfiConverterSequenceTypeMobileMarkerRenderItem : FfiConverterRustBuffer<List<MobileMarkerRenderItem>> {
     override fun read(buf: ByteBuffer): List<MobileMarkerRenderItem> {
         val len = buf.getInt()
         return List<MobileMarkerRenderItem>(len) {
@@ -2243,11 +2454,13 @@ public object FfiConverterSequenceTypeMobileMarkerRenderItem: FfiConverterRustBu
         return sizeForLength + sizeForItems
     }
 
-    override fun write(value: List<MobileMarkerRenderItem>, buf: ByteBuffer) {
+    override fun write(
+        value: List<MobileMarkerRenderItem>,
+        buf: ByteBuffer,
+    ) {
         buf.putInt(value.size)
         value.iterator().forEach {
             FfiConverterTypeMobileMarkerRenderItem.write(it, buf)
         }
     }
 }
-

@@ -1,7 +1,7 @@
 # Mobile Usage
 
-`osm-tile-core` exposes Android and iOS bindings through UniFFI. The mobile API
-is intentionally smaller than the internal Rust API: use `OsmTileCore` as the
+`osm-tile-engine` exposes Android and iOS bindings through UniFFI. The mobile API
+is intentionally smaller than the internal Rust API: use `OsmTileEngine` as the
 main entry point, pass app-private cache paths from the platform, and let the UI
 render markers/clusters with MapLibre, MapKit, or another map view.
 
@@ -11,7 +11,7 @@ Use `10.0.2.2` when an Android emulator needs to reach a tile server running on
 the development machine:
 
 ```kotlin
-val core = OsmTileCore(
+val core = OsmTileEngine(
     tileUrlTemplate = "http://10.0.2.2:8080/tile/{z}/{x}/{y}.png",
     cacheDir = context.filesDir.resolve("tile-cache").path
 )
@@ -58,7 +58,7 @@ let cacheDir = FileManager.default.urls(
     in: .userDomainMask
 )[0].appendingPathComponent("tile-cache")
 
-let core = try OsmTileCore(
+let core = try OsmTileEngine(
     tileUrlTemplate: "http://localhost:8080/tile/{z}/{x}/{y}.png",
     cacheDir: cacheDir.path
 )
@@ -105,6 +105,6 @@ iOS, from macOS with Xcode:
 scripts/build-ios.sh
 ```
 
-The Rust `///` comments on the UniFFI-exposed mobile types and methods are
+The Rust `///` comments in `crates/osm-tile-engine/src/mobile.rs` on the UniFFI-exposed mobile types and methods are
 included in generated Kotlin and Swift bindings, so Android Studio and Xcode can
 show usage hints while editing platform code.

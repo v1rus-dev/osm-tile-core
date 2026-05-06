@@ -3,25 +3,25 @@
 import PackageDescription
 
 let package = Package(
-    name: "OsmTileCore",
+    name: "OsmTileEngine",
     platforms: [
         .iOS(.v13)
     ],
     products: [
         .library(
-            name: "OsmTileCore",
-            targets: ["OsmTileCore"]
+            name: "OsmTileEngine",
+            targets: ["OsmTileEngine"]
         )
     ],
     targets: [
         .target(
-            name: "OsmTileCore",
-            dependencies: ["OsmTileCoreFFI"],
-            path: "Sources/OsmTileCore"
+            name: "OsmTileEngine",
+            dependencies: ["OsmTileEngineFFI"],
+            path: "Sources/OsmTileEngine"
         ),
         .binaryTarget(
-            name: "OsmTileCoreFFI",
-            path: "OsmTileCore.xcframework"
+            name: "OsmTileEngineFFI",
+            path: "OsmTileEngine.xcframework"
         )
     ]
 )

@@ -1,19 +1,22 @@
-[package]
-name = "osm-tile-core"
+[workspace]
+members = [
+    "crates/osm-core",
+    "crates/osm-loader",
+    "crates/osm-renderer",
+    "crates/osm-tile-engine",
+]
+resolver = "3"
+
+[workspace.package]
 version = "0.1.0"
 edition = "2024"
 
-[lib]
-crate-type = ["lib", "cdylib", "staticlib"]
-
-[features]
-default = []
-mobile = ["dep:uniffi", "uniffi/tokio"]
-uniffi-cli = ["dep:uniffi", "uniffi/cli"]
-
-[dependencies]
+[workspace.dependencies]
 async-trait = "0.1"
+osm-core = { path = "crates/osm-core" }
+osm-loader = { path = "crates/osm-loader" }
+osm-renderer = { path = "crates/osm-renderer" }
 reqwest = { version = "0.12", default-features = false, features = ["rustls-tls"] }
 thiserror = "2"
 tokio = { version = "1", features = ["fs", "io-util", "macros", "net", "rt-multi-thread"] }
-uniffi = { version = "0.31.1", optional = true }
+uniffi = { version = "0.31.1" }

@@ -1,5 +1,6 @@
-use crate::geo::{GeoPoint, validate_latitude, validate_longitude};
-use crate::{TileError, TileId};
+use osm_core::{GeoPoint, TileId, validate_latitude, validate_longitude};
+
+use crate::TileError;
 
 pub type MarkerId = u64;
 

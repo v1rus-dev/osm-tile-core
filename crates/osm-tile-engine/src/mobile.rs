@@ -3,10 +3,9 @@ use std::sync::{Arc, Mutex};
 
 use thiserror::Error;
 
-use crate::{
-    CachedTileSource, FileTileCache, GeoBounds, HttpTileSource, MapState, Marker, MarkerCluster,
-    MarkerId, MarkerRenderItem, TileError, TileId, TileSource, Viewport,
-};
+use osm_core::{CoreError, GeoBounds, TileId, Viewport};
+use osm_loader::{CachedTileSource, FileTileCache, HttpTileSource, TileLoadError, TileSource};
+use osm_renderer::{MapState, Marker, MarkerCluster, MarkerId, MarkerRenderItem, RenderError};
 
 /// The currently visible map rectangle and zoom level.
 ///
@@ -94,7 +93,7 @@ pub struct MobileMarkerRenderItem {
 ///
 /// The `details` field is safe to display in logs and developer diagnostics.
 #[derive(Debug, Error, uniffi::Error)]
-pub enum OsmTileCoreError {
+pub enum OsmTileEngineError {
     /// The caller passed invalid coordinates, zoom, ids, or URL template.
     #[error("invalid input: {details}")]
     InvalidInput { details: String },
@@ -120,14 +119,14 @@ pub enum OsmTileCoreError {
 /// background thread, coroutine dispatcher, or Swift task instead of the UI
 /// thread.
 #[derive(uniffi::Object)]
-pub struct OsmTileCore {
+pub struct OsmTileEngine {
     source: CachedTileSource<HttpTileSource>,
     map_state: Mutex<MapState>,
     runtime: tokio::runtime::Runtime,
 }
 
 #[uniffi::export]
-impl OsmTileCore {
+impl OsmTileEngine {
     /// Creates a tile engine with cache-first behavior.
     ///
     /// `tile_url_template` must contain `{z}`, `{x}`, and `{y}` placeholders,
@@ -137,13 +136,14 @@ impl OsmTileCore {
     pub fn new(
         tile_url_template: String,
         cache_dir: String,
-    ) -> Result<Arc<Self>, OsmTileCoreError> {
+    ) -> Result<Arc<Self>, OsmTileEngineError> {
         let http_source = HttpTileSource::new(tile_url_template)?;
         let cache = FileTileCache::new(PathBuf::from(cache_dir));
         let source = CachedTileSource::new(http_source, cache);
-        let runtime = tokio::runtime::Runtime::new().map_err(|error| OsmTileCoreError::State {
-            details: format!("failed to create async runtime: {error}"),
-        })?;
+        let runtime =
+            tokio::runtime::Runtime::new().map_err(|error| OsmTileEngineError::State {
+                details: format!("failed to create async runtime: {error}"),
+            })?;
 
         Ok(Arc::new(Self {
             source,
@@ -157,7 +157,7 @@ impl OsmTileCore {
     /// The method first checks the local offline cache. If the tile is missing,
     /// it downloads the tile from the configured tile server, saves it to cache,
     /// and returns the image bytes. Do not call this from the UI thread.
-    pub fn load_tile(&self, z: i64, x: i64, y: i64) -> Result<Vec<u8>, OsmTileCoreError> {
+    pub fn load_tile(&self, z: i64, x: i64, y: i64) -> Result<Vec<u8>, OsmTileEngineError> {
         let tile_id = TileId::new(
             i64_to_u32(z, "z")?,
             i64_to_u32(x, "x")?,
@@ -166,11 +166,11 @@ impl OsmTileCore {
 
         self.runtime
             .block_on(self.source.load_tile(tile_id))
-            .map_err(OsmTileCoreError::from)
+            .map_err(OsmTileEngineError::from)
     }
 
     /// Updates the current map viewport used by `visibleMarkers` and `clusteredMarkers`.
-    pub fn set_viewport(&self, viewport: MobileViewport) -> Result<(), OsmTileCoreError> {
+    pub fn set_viewport(&self, viewport: MobileViewport) -> Result<(), OsmTileEngineError> {
         let viewport = viewport.try_into_viewport()?;
         let mut state = self.lock_map_state()?;
         state.set_viewport(viewport)?;
@@ -181,7 +181,7 @@ impl OsmTileCore {
     ///
     /// Use this when the app has a complete offline marker set or wants to reset
     /// the working set after a new server query.
-    pub fn replace_markers(&self, markers: Vec<MobileMarker>) -> Result<(), OsmTileCoreError> {
+    pub fn replace_markers(&self, markers: Vec<MobileMarker>) -> Result<(), OsmTileEngineError> {
         let markers = markers
             .into_iter()
             .map(MobileMarker::try_into_marker)
@@ -195,7 +195,7 @@ impl OsmTileCore {
     ///
     /// This is useful when the app loads markers page-by-page or bbox-by-bbox
     /// from a backend. If the same id appears more than once, the last marker wins.
-    pub fn upsert_markers(&self, markers: Vec<MobileMarker>) -> Result<(), OsmTileCoreError> {
+    pub fn upsert_markers(&self, markers: Vec<MobileMarker>) -> Result<(), OsmTileEngineError> {
         let markers = markers
             .into_iter()
             .map(MobileMarker::try_into_marker)
@@ -206,7 +206,7 @@ impl OsmTileCore {
     }
 
     /// Removes one marker from the Rust marker store.
-    pub fn remove_marker(&self, id: i64) -> Result<(), OsmTileCoreError> {
+    pub fn remove_marker(&self, id: i64) -> Result<(), OsmTileEngineError> {
         let id = i64_to_marker_id(id)?;
         let mut state = self.lock_map_state()?;
         state.remove_marker(id);
@@ -214,7 +214,7 @@ impl OsmTileCore {
     }
 
     /// Clears all markers from the Rust marker store.
-    pub fn clear_markers(&self) -> Result<(), OsmTileCoreError> {
+    pub fn clear_markers(&self) -> Result<(), OsmTileEngineError> {
         let mut state = self.lock_map_state()?;
         state.clear_markers();
         Ok(())
@@ -224,7 +224,7 @@ impl OsmTileCore {
     ///
     /// The result is filtered by bbox and marker zoom range, then sorted by id
     /// for stable rendering.
-    pub fn visible_markers(&self) -> Result<Vec<MobileMarker>, OsmTileCoreError> {
+    pub fn visible_markers(&self) -> Result<Vec<MobileMarker>, OsmTileEngineError> {
         let state = self.lock_map_state()?;
         state
             .visible_markers()?
@@ -237,7 +237,7 @@ impl OsmTileCore {
     ///
     /// Rust performs simple grid-based clustering in WebMercator pixel space.
     /// The UI should render markers and clusters using its own icons and views.
-    pub fn clustered_markers(&self) -> Result<Vec<MobileMarkerRenderItem>, OsmTileCoreError> {
+    pub fn clustered_markers(&self) -> Result<Vec<MobileMarkerRenderItem>, OsmTileEngineError> {
         let state = self.lock_map_state()?;
         state
             .clustered_markers()?
@@ -253,7 +253,7 @@ impl OsmTileCore {
     pub fn clustered_all(
         &self,
         zoom: i64,
-    ) -> Result<Vec<MobileMarkerRenderItem>, OsmTileCoreError> {
+    ) -> Result<Vec<MobileMarkerRenderItem>, OsmTileEngineError> {
         let zoom = i64_to_u32(zoom, "zoom")?;
         let state = self.lock_map_state()?;
         state
@@ -264,23 +264,25 @@ impl OsmTileCore {
     }
 }
 
-impl OsmTileCore {
-    fn lock_map_state(&self) -> Result<std::sync::MutexGuard<'_, MapState>, OsmTileCoreError> {
-        self.map_state.lock().map_err(|_| OsmTileCoreError::State {
-            details: "marker state lock is poisoned".to_owned(),
-        })
+impl OsmTileEngine {
+    fn lock_map_state(&self) -> Result<std::sync::MutexGuard<'_, MapState>, OsmTileEngineError> {
+        self.map_state
+            .lock()
+            .map_err(|_| OsmTileEngineError::State {
+                details: "marker state lock is poisoned".to_owned(),
+            })
     }
 }
 
 impl MobileViewport {
-    fn try_into_viewport(self) -> Result<Viewport, OsmTileCoreError> {
+    fn try_into_viewport(self) -> Result<Viewport, OsmTileEngineError> {
         let bounds = GeoBounds::new(self.south, self.west, self.north, self.east)?;
         Ok(Viewport::new(bounds, i64_to_u32(self.zoom, "zoom")?)?)
     }
 }
 
 impl MobileMarker {
-    fn try_into_marker(self) -> Result<Marker, OsmTileCoreError> {
+    fn try_into_marker(self) -> Result<Marker, OsmTileEngineError> {
         Ok(Marker::new(
             i64_to_marker_id(self.id)?,
             self.lat,
@@ -291,7 +293,7 @@ impl MobileMarker {
         )?)
     }
 
-    fn try_from_marker(marker: Marker) -> Result<Self, OsmTileCoreError> {
+    fn try_from_marker(marker: Marker) -> Result<Self, OsmTileEngineError> {
         Ok(Self {
             id: marker_id_to_i64(marker.id)?,
             lat: marker.lat,
@@ -304,7 +306,7 @@ impl MobileMarker {
 }
 
 impl MobileMarkerCluster {
-    fn try_from_cluster(cluster: MarkerCluster) -> Result<Self, OsmTileCoreError> {
+    fn try_from_cluster(cluster: MarkerCluster) -> Result<Self, OsmTileEngineError> {
         Ok(Self {
             id: cluster.id,
             lat: cluster.lat,
@@ -320,7 +322,7 @@ impl MobileMarkerCluster {
 }
 
 impl MobileMarkerRenderItem {
-    fn try_from_render_item(item: MarkerRenderItem) -> Result<Self, OsmTileCoreError> {
+    fn try_from_render_item(item: MarkerRenderItem) -> Result<Self, OsmTileEngineError> {
         match item {
             MarkerRenderItem::Marker(marker) => Ok(Self {
                 item_type: MobileRenderItemType::Marker,
@@ -336,16 +338,21 @@ impl MobileMarkerRenderItem {
     }
 }
 
-impl From<TileError> for OsmTileCoreError {
-    fn from(error: TileError) -> Self {
+impl From<CoreError> for OsmTileEngineError {
+    fn from(error: CoreError) -> Self {
+        Self::InvalidInput {
+            details: error.to_string(),
+        }
+    }
+}
+
+impl From<TileLoadError> for OsmTileEngineError {
+    fn from(error: TileLoadError) -> Self {
         match error {
-            TileError::CacheIo(_) | TileError::InvalidCachePath => Self::Cache {
+            TileLoadError::CacheIo(_) | TileLoadError::InvalidCachePath => Self::Cache {
                 details: error.to_string(),
             },
-            TileError::Network(_) | TileError::HttpStatus(_) => Self::Network {
-                details: error.to_string(),
-            },
-            TileError::MissingViewport => Self::State {
+            TileLoadError::Network(_) | TileLoadError::HttpStatus(_) => Self::Network {
                 details: error.to_string(),
             },
             _ => Self::InvalidInput {
@@ -355,9 +362,22 @@ impl From<TileError> for OsmTileCoreError {
     }
 }
 
-fn i64_to_u32(value: i64, name: &str) -> Result<u32, OsmTileCoreError> {
+impl From<RenderError> for OsmTileEngineError {
+    fn from(error: RenderError) -> Self {
+        match error {
+            RenderError::MissingViewport => Self::State {
+                details: error.to_string(),
+            },
+            _ => Self::InvalidInput {
+                details: error.to_string(),
+            },
+        }
+    }
+}
+
+fn i64_to_u32(value: i64, name: &str) -> Result<u32, OsmTileEngineError> {
     if value < 0 || value > u32::MAX as i64 {
-        return Err(OsmTileCoreError::InvalidInput {
+        return Err(OsmTileEngineError::InvalidInput {
             details: format!("{name} must be in 0..={}", u32::MAX),
         });
     }
@@ -365,9 +385,9 @@ fn i64_to_u32(value: i64, name: &str) -> Result<u32, OsmTileCoreError> {
     Ok(value as u32)
 }
 
-fn i64_to_marker_id(value: i64) -> Result<MarkerId, OsmTileCoreError> {
+fn i64_to_marker_id(value: i64) -> Result<MarkerId, OsmTileEngineError> {
     if value < 0 {
-        return Err(OsmTileCoreError::InvalidInput {
+        return Err(OsmTileEngineError::InvalidInput {
             details: "marker id must be non-negative".to_owned(),
         });
     }
@@ -375,9 +395,9 @@ fn i64_to_marker_id(value: i64) -> Result<MarkerId, OsmTileCoreError> {
     Ok(value as MarkerId)
 }
 
-fn marker_id_to_i64(value: MarkerId) -> Result<i64, OsmTileCoreError> {
+fn marker_id_to_i64(value: MarkerId) -> Result<i64, OsmTileEngineError> {
     if value > i64::MAX as MarkerId {
-        return Err(OsmTileCoreError::InvalidInput {
+        return Err(OsmTileEngineError::InvalidInput {
             details: format!("marker id {value} does not fit into i64"),
         });
     }
@@ -389,9 +409,9 @@ fn u32_to_i64(value: u32) -> i64 {
     i64::from(value)
 }
 
-fn usize_to_i64(value: usize) -> Result<i64, OsmTileCoreError> {
+fn usize_to_i64(value: usize) -> Result<i64, OsmTileEngineError> {
     if value > i64::MAX as usize {
-        return Err(OsmTileCoreError::InvalidInput {
+        return Err(OsmTileEngineError::InvalidInput {
             details: format!("value {value} does not fit into i64"),
         });
     }
@@ -403,11 +423,11 @@ fn usize_to_i64(value: usize) -> Result<i64, OsmTileCoreError> {
 mod tests {
     use super::*;
 
-    fn core() -> Arc<OsmTileCore> {
-        OsmTileCore::new(
+    fn core() -> Arc<OsmTileEngine> {
+        OsmTileEngine::new(
             "http://localhost:8080/tile/{z}/{x}/{y}.png".to_owned(),
             std::env::temp_dir()
-                .join("osm-tile-core-mobile-tests")
+                .join("osm-tile-engine-mobile-tests")
                 .display()
                 .to_string(),
         )
@@ -490,11 +510,11 @@ mod tests {
 
         assert!(matches!(
             core.remove_marker(-1),
-            Err(OsmTileCoreError::InvalidInput { .. })
+            Err(OsmTileEngineError::InvalidInput { .. })
         ));
         assert!(matches!(
             core.load_tile(-1, 0, 0),
-            Err(OsmTileCoreError::InvalidInput { .. })
+            Err(OsmTileEngineError::InvalidInput { .. })
         ));
     }
 }

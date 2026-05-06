@@ -1,7 +1,9 @@
 use thiserror::Error;
 
+use osm_core::CoreError;
+
 #[derive(Debug, Error)]
-pub enum TileError {
+pub enum RenderError {
     #[error("invalid zoom {z}; max supported zoom is {max}")]
     InvalidZoom { z: u32, max: u32 },
 
@@ -9,21 +11,6 @@ pub enum TileError {
         "invalid tile coordinate for z={z}: x={x}, y={y}; coordinates must be less than {limit}"
     )]
     InvalidTileCoordinate { z: u32, x: u32, y: u32, limit: u32 },
-
-    #[error("invalid tile URL template; expected placeholders {{z}}, {{x}}, and {{y}}")]
-    InvalidTemplate,
-
-    #[error("invalid cache path")]
-    InvalidCachePath,
-
-    #[error("cache I/O error: {0}")]
-    CacheIo(#[source] std::io::Error),
-
-    #[error("tile server returned HTTP status {0}")]
-    HttpStatus(reqwest::StatusCode),
-
-    #[error("network request failed: {0}")]
-    Network(#[from] reqwest::Error),
 
     #[error("invalid latitude {lat}; expected value in -90..=90")]
     InvalidLatitude { lat: f64 },
@@ -47,4 +34,28 @@ pub enum TileError {
 
     #[error("map viewport is not set")]
     MissingViewport,
+}
+
+impl From<CoreError> for RenderError {
+    fn from(error: CoreError) -> Self {
+        match error {
+            CoreError::InvalidZoom { z, max } => Self::InvalidZoom { z, max },
+            CoreError::InvalidTileCoordinate { z, x, y, limit } => {
+                Self::InvalidTileCoordinate { z, x, y, limit }
+            }
+            CoreError::InvalidLatitude { lat } => Self::InvalidLatitude { lat },
+            CoreError::InvalidLongitude { lon } => Self::InvalidLongitude { lon },
+            CoreError::InvalidBounds {
+                south,
+                west,
+                north,
+                east,
+            } => Self::InvalidBounds {
+                south,
+                west,
+                north,
+                east,
+            },
+        }
+    }
 }

@@ -1,0 +1,12 @@
+[bindings.kotlin]
+package_name = "yegor.cheprasov.osmtileengine"
+cdylib_name = "osm_tile_engine"
+android = true
+generate_immutable_records = true
+
+[bindings.swift]
+module_name = "OsmTileEngine"
+ffi_module_name = "OsmTileEngineFFI"
+cdylib_name = "osm_tile_engine"
+generate_immutable_records = true
+generate_codable_conformance = true

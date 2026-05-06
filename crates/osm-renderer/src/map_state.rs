@@ -1,13 +1,10 @@
 use std::collections::HashMap;
 
 use crate::{
-    GeoPoint, Marker, MarkerCluster, MarkerId, MarkerRenderItem, TileError, TileId, Viewport,
+    MapProjection, Marker, MarkerCluster, MarkerId, MarkerRenderItem, TileError, TileId, Viewport,
 };
 
 pub const DEFAULT_CLUSTER_RADIUS_PX: f64 = 64.0;
-const TILE_SIZE_PX: f64 = 256.0;
-const WEB_MERCATOR_MAX_LAT: f64 = 85.051_128_78;
-
 #[derive(Debug, Clone)]
 pub struct MapState {
     viewport: Option<Viewport>,
@@ -172,7 +169,8 @@ fn cluster_markers(
     let mut cells = HashMap::<(i64, i64), Vec<Marker>>::new();
 
     for marker in markers {
-        let (world_x, world_y) = project_to_world_pixels(marker.point(), zoom);
+        let (world_x, world_y) =
+            MapProjection::WebMercator.project_to_world_pixels(marker.point(), zoom)?;
         let cell = (
             (world_x / radius_px).floor() as i64,
             (world_y / radius_px).floor() as i64,
@@ -209,17 +207,6 @@ fn cluster_markers(
     }
 
     Ok(items)
-}
-
-fn project_to_world_pixels(point: GeoPoint, zoom: u32) -> (f64, f64) {
-    let lat = point.lat.clamp(-WEB_MERCATOR_MAX_LAT, WEB_MERCATOR_MAX_LAT);
-    let world_size = TILE_SIZE_PX * 2_f64.powi(zoom as i32);
-    let x = (point.lon + 180.0) / 360.0 * world_size;
-    let lat_rad = lat.to_radians();
-    let y = (1.0 - ((lat_rad.tan() + 1.0 / lat_rad.cos()).ln() / std::f64::consts::PI)) / 2.0
-        * world_size;
-
-    (x, y)
 }
 
 fn validate_zoom(zoom: u32) -> Result<(), TileError> {
