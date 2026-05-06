@@ -5,8 +5,7 @@ use std::path::PathBuf;
 use std::ptr::NonNull;
 #[cfg(feature = "mobile")]
 use std::sync::Arc;
-use std::sync::mpsc::{self, Receiver, RecvTimeoutError, Sender};
-use std::sync::mpsc::{self, TryRecvError};
+use std::sync::mpsc::{self, Receiver, RecvTimeoutError, Sender, TryRecvError};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
