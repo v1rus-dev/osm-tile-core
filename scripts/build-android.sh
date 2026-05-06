@@ -58,7 +58,7 @@ cargo run -p osm-tile-engine --features uniffi-cli --bin uniffi-bindgen -- \
 cargo ndk \
   "${TARGET_ARGS[@]}" \
   -o "$JNI_LIBS_DIR" \
-  build -p osm-tile-engine --release --features mobile
+  build -p osm-tile-engine --release --features mobile,android-renderer
 
 echo "Android artifacts generated in $ANDROID_DIR"
 echo "Built Android ABIs: $ANDROID_ABIS"

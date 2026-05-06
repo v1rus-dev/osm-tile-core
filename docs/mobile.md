@@ -48,6 +48,29 @@ val renderItems = core.clusteredMarkers()
 `loadTile` is synchronous in v1. Call it from a background dispatcher, not from
 the Android UI thread.
 
+
+## Android Native Map View MVP
+
+The Android package also includes `OsmMapView`, a `SurfaceView` wrapper for the
+native renderer path. This view is separate from the generated UniFFI
+`OsmTileEngine` class: UniFFI remains the cross-platform data/control API, while
+`OsmMapView` owns Android surface lifecycle and gestures.
+
+```kotlin
+val mapView = OsmMapView(context).apply {
+    setTileUrlTemplate("http://10.0.2.2:8080/tile/{z}/{x}/{y}.png")
+    setCacheDir(context.filesDir.resolve("tile-cache").path)
+    setCamera(centerLat = 53.9023, centerLon = 27.5619, zoom = 12.0)
+    addTileLayer(layerId = "base")
+}
+```
+
+`OsmMapView` currently provides the Android/JNI renderer skeleton: it creates a
+native renderer thread, forwards `SurfaceView` lifecycle events, handles drag and
+pinch gestures, keeps an ordered typed layer stack, and loads visible raster
+tiles through the existing cache-first loader. The final `wgpu::Surface` binding
+and tile quad presentation are the next renderer step.
+
 ## iOS
 
 Use an app-private cache directory, for example inside `cachesDirectory`:

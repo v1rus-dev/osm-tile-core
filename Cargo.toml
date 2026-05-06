@@ -13,6 +13,8 @@ edition = "2024"
 
 [workspace.dependencies]
 async-trait = "0.1"
+image = { version = "0.25", default-features = false, features = ["jpeg", "png"] }
+jni = "0.21"
 osm-core = { path = "crates/osm-core" }
 osm-loader = { path = "crates/osm-loader" }
 osm-renderer = { path = "crates/osm-renderer" }
@@ -20,3 +22,4 @@ reqwest = { version = "0.12", default-features = false, features = ["rustls-tls"
 thiserror = "2"
 tokio = { version = "1", features = ["fs", "io-util", "macros", "net", "rt-multi-thread"] }
 uniffi = { version = "0.31.1" }
+wgpu = "29.0.1"

@@ -9,3 +9,6 @@ pub use mobile::{
     MobileMarker, MobileMarkerCluster, MobileMarkerRenderItem, MobileRenderItemType,
     MobileViewport, OsmTileEngine, OsmTileEngineError,
 };
+
+#[cfg(feature = "android-renderer")]
+pub mod android_renderer;

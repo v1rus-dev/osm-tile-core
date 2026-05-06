@@ -10,12 +10,16 @@ crate-type = ["lib", "cdylib", "staticlib"]
 [features]
 default = []
 mobile = ["dep:uniffi", "uniffi/tokio"]
+android-renderer = ["dep:image", "dep:jni", "dep:wgpu"]
 uniffi-cli = ["dep:uniffi", "uniffi/cli"]
 
 [dependencies]
+image = { workspace = true, optional = true }
+jni = { workspace = true, optional = true }
 osm-core.workspace = true
 osm-loader.workspace = true
 osm-renderer.workspace = true
 thiserror.workspace = true
 tokio.workspace = true
 uniffi = { workspace = true, optional = true }
+wgpu = { workspace = true, optional = true }

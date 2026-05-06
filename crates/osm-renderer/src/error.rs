@@ -32,6 +32,34 @@ pub enum RenderError {
     #[error("invalid cluster radius {radius}; expected a positive finite value")]
     InvalidClusterRadius { radius: f64 },
 
+    #[error("invalid camera zoom {zoom}; max supported zoom is {max}")]
+    InvalidCameraZoom { zoom: f64, max: u32 },
+
+    #[error("invalid camera {name} angle {value}")]
+    InvalidCameraAngle { name: &'static str, value: f64 },
+
+    #[error("invalid render viewport: width={width_px}, height={height_px}, density={density}")]
+    InvalidRenderViewport {
+        width_px: u32,
+        height_px: u32,
+        density: f64,
+    },
+
+    #[error("render viewport is not set")]
+    MissingRenderViewport,
+
+    #[error("invalid layer id")]
+    InvalidLayerId,
+
+    #[error("invalid layer opacity {opacity}; expected 0.0..=1.0")]
+    InvalidLayerOpacity { opacity: f32 },
+
+    #[error("invalid layer zoom range: min_zoom={min_zoom}, max_zoom={max_zoom}")]
+    InvalidLayerZoomRange { min_zoom: u32, max_zoom: u32 },
+
+    #[error("missing layer {id}")]
+    MissingLayer { id: String },
+
     #[error("map viewport is not set")]
     MissingViewport,
 }
