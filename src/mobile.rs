@@ -92,24 +92,24 @@ pub struct MobileMarkerRenderItem {
 
 /// Error type exposed to Kotlin and Swift callers.
 ///
-/// The `message` field is safe to display in logs and developer diagnostics.
+/// The `details` field is safe to display in logs and developer diagnostics.
 #[derive(Debug, Error, uniffi::Error)]
 pub enum OsmTileCoreError {
     /// The caller passed invalid coordinates, zoom, ids, or URL template.
-    #[error("invalid input: {message}")]
-    InvalidInput { message: String },
+    #[error("invalid input: {details}")]
+    InvalidInput { details: String },
 
     /// The tile cache could not read or write local files.
-    #[error("cache error: {message}")]
-    Cache { message: String },
+    #[error("cache error: {details}")]
+    Cache { details: String },
 
     /// The tile server request failed or returned a non-success HTTP status.
-    #[error("network error: {message}")]
-    Network { message: String },
+    #[error("network error: {details}")]
+    Network { details: String },
 
     /// The map state is not ready for the requested operation.
-    #[error("state error: {message}")]
-    State { message: String },
+    #[error("state error: {details}")]
+    State { details: String },
 }
 
 /// Main entry point for Android and iOS apps.
@@ -142,7 +142,7 @@ impl OsmTileCore {
         let cache = FileTileCache::new(PathBuf::from(cache_dir));
         let source = CachedTileSource::new(http_source, cache);
         let runtime = tokio::runtime::Runtime::new().map_err(|error| OsmTileCoreError::State {
-            message: format!("failed to create async runtime: {error}"),
+            details: format!("failed to create async runtime: {error}"),
         })?;
 
         Ok(Arc::new(Self {
@@ -267,7 +267,7 @@ impl OsmTileCore {
 impl OsmTileCore {
     fn lock_map_state(&self) -> Result<std::sync::MutexGuard<'_, MapState>, OsmTileCoreError> {
         self.map_state.lock().map_err(|_| OsmTileCoreError::State {
-            message: "marker state lock is poisoned".to_owned(),
+            details: "marker state lock is poisoned".to_owned(),
         })
     }
 }
@@ -340,16 +340,16 @@ impl From<TileError> for OsmTileCoreError {
     fn from(error: TileError) -> Self {
         match error {
             TileError::CacheIo(_) | TileError::InvalidCachePath => Self::Cache {
-                message: error.to_string(),
+                details: error.to_string(),
             },
             TileError::Network(_) | TileError::HttpStatus(_) => Self::Network {
-                message: error.to_string(),
+                details: error.to_string(),
             },
             TileError::MissingViewport => Self::State {
-                message: error.to_string(),
+                details: error.to_string(),
             },
             _ => Self::InvalidInput {
-                message: error.to_string(),
+                details: error.to_string(),
             },
         }
     }
@@ -358,7 +358,7 @@ impl From<TileError> for OsmTileCoreError {
 fn i64_to_u32(value: i64, name: &str) -> Result<u32, OsmTileCoreError> {
     if value < 0 || value > u32::MAX as i64 {
         return Err(OsmTileCoreError::InvalidInput {
-            message: format!("{name} must be in 0..={}", u32::MAX),
+            details: format!("{name} must be in 0..={}", u32::MAX),
         });
     }
 
@@ -368,7 +368,7 @@ fn i64_to_u32(value: i64, name: &str) -> Result<u32, OsmTileCoreError> {
 fn i64_to_marker_id(value: i64) -> Result<MarkerId, OsmTileCoreError> {
     if value < 0 {
         return Err(OsmTileCoreError::InvalidInput {
-            message: "marker id must be non-negative".to_owned(),
+            details: "marker id must be non-negative".to_owned(),
         });
     }
 
@@ -378,7 +378,7 @@ fn i64_to_marker_id(value: i64) -> Result<MarkerId, OsmTileCoreError> {
 fn marker_id_to_i64(value: MarkerId) -> Result<i64, OsmTileCoreError> {
     if value > i64::MAX as MarkerId {
         return Err(OsmTileCoreError::InvalidInput {
-            message: format!("marker id {value} does not fit into i64"),
+            details: format!("marker id {value} does not fit into i64"),
         });
     }
 
@@ -392,7 +392,7 @@ fn u32_to_i64(value: u32) -> i64 {
 fn usize_to_i64(value: usize) -> Result<i64, OsmTileCoreError> {
     if value > i64::MAX as usize {
         return Err(OsmTileCoreError::InvalidInput {
-            message: format!("value {value} does not fit into i64"),
+            details: format!("value {value} does not fit into i64"),
         });
     }
 

@@ -1315,7 +1315,7 @@ public func FfiConverterTypeMobileRenderItemType_lower(_ value: MobileRenderItem
 /**
  * Error type exposed to Kotlin and Swift callers.
  *
- * The `message` field is safe to display in logs and developer diagnostics.
+ * The `details` field is safe to display in logs and developer diagnostics.
  */
 public enum OsmTileCoreError: Swift.Error, Equatable, Hashable, Codable, Foundation.LocalizedError {
 
@@ -1324,22 +1324,22 @@ public enum OsmTileCoreError: Swift.Error, Equatable, Hashable, Codable, Foundat
     /**
      * The caller passed invalid coordinates, zoom, ids, or URL template.
      */
-    case InvalidInput(message: String
+    case InvalidInput(details: String
     )
     /**
      * The tile cache could not read or write local files.
      */
-    case Cache(message: String
+    case Cache(details: String
     )
     /**
      * The tile server request failed or returned a non-success HTTP status.
      */
-    case Network(message: String
+    case Network(details: String
     )
     /**
      * The map state is not ready for the requested operation.
      */
-    case State(message: String
+    case State(details: String
     )
 
     
@@ -1371,16 +1371,16 @@ public struct FfiConverterTypeOsmTileCoreError: FfiConverterRustBuffer {
 
         
         case 1: return .InvalidInput(
-            message: try FfiConverterString.read(from: &buf)
+            details: try FfiConverterString.read(from: &buf)
             )
         case 2: return .Cache(
-            message: try FfiConverterString.read(from: &buf)
+            details: try FfiConverterString.read(from: &buf)
             )
         case 3: return .Network(
-            message: try FfiConverterString.read(from: &buf)
+            details: try FfiConverterString.read(from: &buf)
             )
         case 4: return .State(
-            message: try FfiConverterString.read(from: &buf)
+            details: try FfiConverterString.read(from: &buf)
             )
 
          default: throw UniffiInternalError.unexpectedEnumCase
@@ -1394,24 +1394,24 @@ public struct FfiConverterTypeOsmTileCoreError: FfiConverterRustBuffer {
 
         
         
-        case let .InvalidInput(message):
+        case let .InvalidInput(details):
             writeInt(&buf, Int32(1))
-            FfiConverterString.write(message, into: &buf)
+            FfiConverterString.write(details, into: &buf)
             
         
-        case let .Cache(message):
+        case let .Cache(details):
             writeInt(&buf, Int32(2))
-            FfiConverterString.write(message, into: &buf)
+            FfiConverterString.write(details, into: &buf)
             
         
-        case let .Network(message):
+        case let .Network(details):
             writeInt(&buf, Int32(3))
-            FfiConverterString.write(message, into: &buf)
+            FfiConverterString.write(details, into: &buf)
             
         
-        case let .State(message):
+        case let .State(details):
             writeInt(&buf, Int32(4))
-            FfiConverterString.write(message, into: &buf)
+            FfiConverterString.write(details, into: &buf)
             
         }
     }

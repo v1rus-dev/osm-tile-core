@@ -1968,7 +1968,7 @@ public object FfiConverterTypeMobileRenderItemType: FfiConverterRustBuffer<Mobil
 /**
  * Error type exposed to Kotlin and Swift callers.
  *
- * The `message` field is safe to display in logs and developer diagnostics.
+ * The `details` field is safe to display in logs and developer diagnostics.
  */
 sealed class OsmTileCoreException: kotlin.Exception() {
     
@@ -1977,10 +1977,10 @@ sealed class OsmTileCoreException: kotlin.Exception() {
      */
     class InvalidInput(
         
-        val `message`: kotlin.String
+        val `details`: kotlin.String
         ) : OsmTileCoreException() {
         override val message
-            get() = "message=${ `message` }"
+            get() = "details=${ `details` }"
     }
     
     /**
@@ -1988,10 +1988,10 @@ sealed class OsmTileCoreException: kotlin.Exception() {
      */
     class Cache(
         
-        val `message`: kotlin.String
+        val `details`: kotlin.String
         ) : OsmTileCoreException() {
         override val message
-            get() = "message=${ `message` }"
+            get() = "details=${ `details` }"
     }
     
     /**
@@ -1999,10 +1999,10 @@ sealed class OsmTileCoreException: kotlin.Exception() {
      */
     class Network(
         
-        val `message`: kotlin.String
+        val `details`: kotlin.String
         ) : OsmTileCoreException() {
         override val message
-            get() = "message=${ `message` }"
+            get() = "details=${ `details` }"
     }
     
     /**
@@ -2010,10 +2010,10 @@ sealed class OsmTileCoreException: kotlin.Exception() {
      */
     class State(
         
-        val `message`: kotlin.String
+        val `details`: kotlin.String
         ) : OsmTileCoreException() {
         override val message
-            get() = "message=${ `message` }"
+            get() = "details=${ `details` }"
     }
     
 
@@ -2056,22 +2056,22 @@ public object FfiConverterTypeOsmTileCoreError : FfiConverterRustBuffer<OsmTileC
             is OsmTileCoreException.InvalidInput -> (
                 // Add the size for the Int that specifies the variant plus the size needed for all fields
                 4UL
-                + FfiConverterString.allocationSize(value.`message`)
+                + FfiConverterString.allocationSize(value.`details`)
             )
             is OsmTileCoreException.Cache -> (
                 // Add the size for the Int that specifies the variant plus the size needed for all fields
                 4UL
-                + FfiConverterString.allocationSize(value.`message`)
+                + FfiConverterString.allocationSize(value.`details`)
             )
             is OsmTileCoreException.Network -> (
                 // Add the size for the Int that specifies the variant plus the size needed for all fields
                 4UL
-                + FfiConverterString.allocationSize(value.`message`)
+                + FfiConverterString.allocationSize(value.`details`)
             )
             is OsmTileCoreException.State -> (
                 // Add the size for the Int that specifies the variant plus the size needed for all fields
                 4UL
-                + FfiConverterString.allocationSize(value.`message`)
+                + FfiConverterString.allocationSize(value.`details`)
             )
         }
     }
@@ -2080,22 +2080,22 @@ public object FfiConverterTypeOsmTileCoreError : FfiConverterRustBuffer<OsmTileC
         when(value) {
             is OsmTileCoreException.InvalidInput -> {
                 buf.putInt(1)
-                FfiConverterString.write(value.`message`, buf)
+                FfiConverterString.write(value.`details`, buf)
                 Unit
             }
             is OsmTileCoreException.Cache -> {
                 buf.putInt(2)
-                FfiConverterString.write(value.`message`, buf)
+                FfiConverterString.write(value.`details`, buf)
                 Unit
             }
             is OsmTileCoreException.Network -> {
                 buf.putInt(3)
-                FfiConverterString.write(value.`message`, buf)
+                FfiConverterString.write(value.`details`, buf)
                 Unit
             }
             is OsmTileCoreException.State -> {
                 buf.putInt(4)
-                FfiConverterString.write(value.`message`, buf)
+                FfiConverterString.write(value.`details`, buf)
                 Unit
             }
         }.let { /* this makes the `when` an expression, which ensures it is exhaustive */ }
