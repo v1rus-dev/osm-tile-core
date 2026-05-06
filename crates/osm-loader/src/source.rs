@@ -1,10 +1,13 @@
 use async_trait::async_trait;
 use reqwest::header::{ACCEPT, HeaderValue};
+use std::time::Duration;
 
 use crate::{FileTileCache, TileError, TileId};
 
 const TILE_USER_AGENT: &str = "osm-tile-engine/0.1";
 const TILE_ACCEPT_HEADER: &str = "image/webp,image/png,image/jpeg,*/*;q=0.8";
+const TILE_HTTP_CONNECT_TIMEOUT: Duration = Duration::from_secs(3);
+const TILE_HTTP_REQUEST_TIMEOUT: Duration = Duration::from_secs(10);
 
 #[async_trait]
 pub trait TileSource: Send + Sync {
@@ -32,6 +35,8 @@ impl HttpTileSource {
             url_template,
             client: reqwest::Client::builder()
                 .user_agent(TILE_USER_AGENT)
+                .connect_timeout(TILE_HTTP_CONNECT_TIMEOUT)
+                .timeout(TILE_HTTP_REQUEST_TIMEOUT)
                 .build()?,
         })
     }

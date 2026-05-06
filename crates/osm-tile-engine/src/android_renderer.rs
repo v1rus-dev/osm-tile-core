@@ -771,11 +771,18 @@ impl RendererWorker {
                             .get(&id)
                             .map(|current| current.generation == metadata.generation)
                             .unwrap_or(false);
+                        let still_relevant = self.pending_metadata.contains_key(&id);
                         self.pending_tile_loads.remove(&id);
-                        if is_current {
+                        if still_relevant {
                             self.telemetry.record_fetch(fetch_elapsed);
                             self.telemetry.record_decode(decode_elapsed);
                             self.pending_metadata.remove(&id);
+                            if !is_current {
+                                log_debug(format!(
+                                    "accepting stale tile z={} x={} y={} generation={} as fallback",
+                                    id.z, id.x, id.y, metadata.generation
+                                ));
+                            }
                             if let Some(error) = error {
                                 log_warn(format!(
                                     "tile z={} x={} y={} failed: {}",
