@@ -219,7 +219,6 @@ enum TileLoaderRequest {
 #[derive(Debug, Clone, Copy)]
 struct TileRequestMetadata {
     generation: u64,
-    requested_at: Instant,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -266,8 +265,31 @@ struct RendererWorker {
     request_generation: u64,
     last_camera_center: Option<(f64, f64)>,
     camera_velocity_hint: (f32, f32),
+    pending_tile_priorities: HashMap<TileId, TilePriority>,
     tile_requests: Sender<TileLoaderRequest>,
     gpu: Option<GpuSurface>,
+    camera_motion: CameraMotion,
+    frame_timing: FrameTiming,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+enum TilePriority {
+    P0Visible = 0,
+    P1LookAhead = 1,
+    P2Periphery = 2,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct CameraMotion {
+    last_camera: Option<MapCamera>,
+    last_update: Option<Instant>,
+    velocity_tiles_per_sec: (f64, f64),
+}
+
+#[derive(Debug, Clone, Copy)]
+struct FrameTiming {
+    last_frame: Option<Instant>,
+    frame_interval: Duration,
 }
 
 struct GpuSurface {
@@ -296,8 +318,18 @@ impl RendererWorker {
             request_generation: 0,
             last_camera_center: None,
             camera_velocity_hint: (0.0, 0.0),
+            pending_tile_priorities: HashMap::new(),
             tile_requests,
             gpu: None,
+            camera_motion: CameraMotion {
+                last_camera: None,
+                last_update: None,
+                velocity_tiles_per_sec: (0.0, 0.0),
+            },
+            frame_timing: FrameTiming {
+                last_frame: None,
+                frame_interval: Duration::from_millis(16),
+            },
         }
     }
 
@@ -333,6 +365,7 @@ impl RendererWorker {
                     self.update_camera_velocity_hint(camera);
                     let _ = self.state.set_camera(camera);
                     self.request_generation = self.request_generation.saturating_add(1);
+                    self.update_camera_motion(camera);
                     self.render_frame();
                 }
                 RenderCommand::AddTileLayer {
@@ -408,6 +441,11 @@ impl RendererWorker {
     }
 
     fn render_frame(&mut self) {
+        let now = Instant::now();
+        if let Some(prev) = self.frame_timing.last_frame {
+            self.frame_timing.frame_interval = now.saturating_duration_since(prev);
+        }
+        self.frame_timing.last_frame = Some(now);
         let visible_tiles = if self.has_visible_tile_layer() {
             self.state.visible_tiles().ok()
         } else {
@@ -424,35 +462,224 @@ impl RendererWorker {
     }
 
     fn ensure_visible_tiles(&mut self, visible_tiles: &[osm_renderer::VisibleTile]) {
+        let request_plan = self.build_tile_request_plan(visible_tiles);
+        self.pending_tile_loads
+            .retain(|tile_id| request_plan.contains_key(tile_id));
+        self.pending_metadata
+            .retain(|tile_id, _| request_plan.contains_key(tile_id));
+        self.pending_tile_priorities
+            .retain(|tile_id, _| request_plan.contains_key(tile_id));
+
+        let mut ordered_requests = request_plan
+            .iter()
+            .filter(|(tile_id, _)| {
+                !self.loaded_tiles.contains_key(tile_id)
+                    && !self.pending_tile_loads.contains(tile_id)
+            })
+            .map(|(tile_id, priority)| (*tile_id, *priority))
+            .collect::<Vec<_>>();
+        ordered_requests.sort_by_key(|(_, priority)| *priority);
+
+        let max_inflight = self.prefetch_budget();
+        let available_slots = max_inflight.saturating_sub(self.pending_tile_loads.len());
+        for (tile_id, priority) in ordered_requests.into_iter().take(available_slots) {
+            let metadata = TileRequestMetadata {
+                generation: self.request_generation,
+            };
+            self.pending_tile_loads.insert(tile_id);
+            self.pending_tile_priorities.insert(tile_id, priority);
+            self.pending_metadata.insert(tile_id, metadata);
+            let _ = self
+                .tile_requests
+                .send(TileLoaderRequest::Load(TileLoadRequest {
+                    id: tile_id,
+                    metadata,
+                    priority: self.tile_request_priority(tile_id, priority, visible_tiles),
+                }));
+        }
+
         for visible_tile in visible_tiles {
             let tile_id = visible_tile.id;
-
-            if !self.loaded_tiles.contains_key(&tile_id)
-                && !self.pending_tile_loads.contains(&tile_id)
+            if let (Some(gpu), Some(tile_data)) =
+                (self.gpu.as_mut(), self.loaded_tiles.get(&tile_id).cloned())
             {
-                let metadata = TileRequestMetadata {
-                    generation: self.request_generation,
-                    requested_at: Instant::now(),
-                };
-                let priority = self.tile_priority(visible_tile);
-                self.pending_tile_loads.insert(tile_id);
-                self.pending_metadata.insert(tile_id, metadata);
-                let _ = self
-                    .tile_requests
-                    .send(TileLoaderRequest::Load(TileLoadRequest {
-                        id: tile_id,
-                        metadata,
-                        priority,
-                    }));
-            }
-
-            let tile_data = self.loaded_tiles.get(&tile_id).cloned();
-            if let (Some(gpu), Some(tile_data)) = (self.gpu.as_mut(), tile_data) {
                 if !gpu.uploaded_tiles.contains_key(&tile_id) {
                     gpu.upload_tile(tile_id, &tile_data);
                 }
             }
         }
+    }
+
+    fn update_camera_motion(&mut self, camera: MapCamera) {
+        let now = Instant::now();
+        if let (Some(last_camera), Some(last_update)) = (
+            self.camera_motion.last_camera,
+            self.camera_motion.last_update,
+        ) {
+            let dt = now.saturating_duration_since(last_update).as_secs_f64();
+            if dt > 0.0 {
+                let zoom = camera.tile_zoom();
+                let prev = osm_core::GeoPoint::new(last_camera.center_lat, last_camera.center_lon);
+                let curr = osm_core::GeoPoint::new(camera.center_lat, camera.center_lon);
+                if let (Ok(prev), Ok(curr)) = (prev, curr) {
+                    if let (Ok((px, py)), Ok((cx, cy))) = (
+                        osm_core::MapProjection::WebMercator.project_to_world_pixels(prev, zoom),
+                        osm_core::MapProjection::WebMercator.project_to_world_pixels(curr, zoom),
+                    ) {
+                        let dx_tiles = (cx - px) / osm_core::TILE_SIZE_PX;
+                        let dy_tiles = (cy - py) / osm_core::TILE_SIZE_PX;
+                        self.camera_motion.velocity_tiles_per_sec = (dx_tiles / dt, dy_tiles / dt);
+                    }
+                }
+            }
+        }
+        self.camera_motion.last_camera = Some(camera);
+        self.camera_motion.last_update = Some(now);
+    }
+
+    fn build_tile_request_plan(
+        &self,
+        visible_tiles: &[osm_renderer::VisibleTile],
+    ) -> HashMap<TileId, TilePriority> {
+        let mut plan = HashMap::new();
+        if visible_tiles.is_empty() {
+            return plan;
+        }
+        let zoom = visible_tiles[0].id.z;
+        let limit = 1_i64 << zoom;
+        let min_x = visible_tiles
+            .iter()
+            .map(|t| t.id.x as i64)
+            .min()
+            .unwrap_or(0);
+        let max_x = visible_tiles
+            .iter()
+            .map(|t| t.id.x as i64)
+            .max()
+            .unwrap_or(0);
+        let min_y = visible_tiles
+            .iter()
+            .map(|t| t.id.y as i64)
+            .min()
+            .unwrap_or(0);
+        let max_y = visible_tiles
+            .iter()
+            .map(|t| t.id.y as i64)
+            .max()
+            .unwrap_or(0);
+        for tile in visible_tiles {
+            plan.insert(tile.id, TilePriority::P0Visible);
+        }
+        let rings = self.dynamic_prefetch_rings();
+        for ring in 1..=rings {
+            for y in (min_y - ring as i64)..=(max_y + ring as i64) {
+                if y < 0 || y >= limit {
+                    continue;
+                }
+                for x in (min_x - ring as i64)..=(max_x + ring as i64) {
+                    let border = x == min_x - ring as i64
+                        || x == max_x + ring as i64
+                        || y == min_y - ring as i64
+                        || y == max_y + ring as i64;
+                    if !border {
+                        continue;
+                    }
+                    let wrapped_x = x.rem_euclid(limit);
+                    if let Ok(id) = TileId::new(zoom, wrapped_x as u32, y as u32) {
+                        plan.entry(id).or_insert(TilePriority::P2Periphery);
+                    }
+                }
+            }
+        }
+        for id in self.look_ahead_tiles(zoom, min_x, max_x, min_y, max_y) {
+            if !matches!(plan.get(&id), Some(TilePriority::P0Visible)) {
+                plan.insert(id, TilePriority::P1LookAhead);
+            }
+        }
+        plan
+    }
+
+    fn dynamic_prefetch_rings(&self) -> u32 {
+        let speed = self
+            .camera_motion
+            .velocity_tiles_per_sec
+            .0
+            .hypot(self.camera_motion.velocity_tiles_per_sec.1);
+        if speed > 3.5 {
+            3
+        } else if speed > 1.5 {
+            2
+        } else {
+            1
+        }
+    }
+
+    fn look_ahead_tiles(
+        &self,
+        zoom: u32,
+        min_x: i64,
+        max_x: i64,
+        min_y: i64,
+        max_y: i64,
+    ) -> Vec<TileId> {
+        let limit = 1_i64 << zoom;
+        let (vx, vy) = self.camera_motion.velocity_tiles_per_sec;
+        let speed = vx.hypot(vy);
+        if speed < 0.25 {
+            return Vec::new();
+        }
+        let dir_x = vx / speed;
+        let dir_y = vy / speed;
+        let depth = (speed.ceil() as i64).clamp(1, 3);
+        let half_width = 1_i64;
+        let mut tiles = Vec::new();
+        for step in 1..=depth {
+            for lateral in -half_width..=half_width {
+                let ahead_x = ((min_x + max_x) / 2)
+                    + (dir_x * step as f64).round() as i64
+                    + (dir_y * lateral as f64).round() as i64;
+                let ahead_y = ((min_y + max_y) / 2) + (dir_y * step as f64).round() as i64
+                    - (dir_x * lateral as f64).round() as i64;
+                if ahead_y < 0 || ahead_y >= limit {
+                    continue;
+                }
+                let wrapped_x = ahead_x.rem_euclid(limit);
+                if let Ok(id) = TileId::new(zoom, wrapped_x as u32, ahead_y as u32) {
+                    tiles.push(id);
+                }
+            }
+        }
+        tiles
+    }
+
+    fn prefetch_budget(&self) -> usize {
+        let ms = self.frame_timing.frame_interval.as_millis();
+        if ms > 40 {
+            4
+        } else if ms > 24 {
+            8
+        } else {
+            12
+        }
+    }
+
+    fn tile_request_priority(
+        &self,
+        tile_id: TileId,
+        priority: TilePriority,
+        visible_tiles: &[osm_renderer::VisibleTile],
+    ) -> f32 {
+        let tier = match priority {
+            TilePriority::P0Visible => 3_000.0,
+            TilePriority::P1LookAhead => 2_000.0,
+            TilePriority::P2Periphery => 1_000.0,
+        };
+        let screen_priority = visible_tiles
+            .iter()
+            .find(|tile| tile.id == tile_id)
+            .map(|tile| self.tile_priority(tile))
+            .unwrap_or(0.0);
+        tier + screen_priority
     }
 
     fn has_visible_tile_layer(&self) -> bool {
@@ -503,7 +730,7 @@ fn tile_loader_loop(
         Ok(runtime) => runtime,
         Err(_) => return,
     };
-    let mut queued = BinaryHeap::new();
+    let mut queued: BinaryHeap<PrioritizedTileRequest> = BinaryHeap::new();
     let mut in_flight = HashSet::new();
     let mut in_flight_tasks = tokio::task::JoinSet::new();
     let mut shutting_down = false;
@@ -513,6 +740,7 @@ fn tile_loader_loop(
             let Some(request) = queued.pop() else {
                 break;
             };
+            let request = request.0;
             if request.metadata.generation
                 != newest_generation(&queued, request.metadata.generation)
             {
@@ -568,12 +796,6 @@ fn tile_loader_loop(
 #[derive(Debug, Clone, Copy)]
 struct PrioritizedTileRequest(TileLoadRequest);
 
-impl PrioritizedTileRequest {
-    fn id(&self) -> TileId {
-        self.0.id
-    }
-}
-
 impl PartialEq for PrioritizedTileRequest {
     fn eq(&self, other: &Self) -> bool {
         self.0.id == other.0.id
@@ -599,8 +821,10 @@ impl Ord for PrioritizedTileRequest {
 
 fn newest_generation(queue: &BinaryHeap<PrioritizedTileRequest>, fallback: u64) -> u64 {
     queue
-        .peek()
+        .iter()
         .map(|entry| entry.0.metadata.generation)
+        .max()
+        .map(|generation| generation.max(fallback))
         .unwrap_or(fallback)
 }
 
