@@ -1,0 +1,9 @@
+[package]
+name = "osm-renderer"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+osm-core.workspace = true
+osm-loader.workspace = true
+thiserror.workspace = true

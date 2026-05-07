@@ -1,0 +1,11 @@
+[package]
+name = "osm-loader"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+async-trait.workspace = true
+osm-core.workspace = true
+reqwest.workspace = true
+thiserror.workspace = true
+tokio.workspace = true

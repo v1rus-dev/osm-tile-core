@@ -2,7 +2,8 @@ use std::env;
 use std::error::Error;
 use std::path::PathBuf;
 
-use osm_tile_core::{CachedTileSource, FileTileCache, HttpTileSource, TileId, TileSource};
+use osm_core::TileId;
+use osm_loader::{CachedTileSource, FileTileCache, HttpTileSource, TileSource};
 
 const DEFAULT_URL_TEMPLATE: &str = "http://localhost:8080/tile/{z}/{x}/{y}.png";
 const DEFAULT_CACHE_DIR: &str = "/tmp/osm-tile-cache";
@@ -72,5 +73,5 @@ fn hit_miss(is_cached: bool) -> &'static str {
 }
 
 fn usage() -> &'static str {
-    "usage: cargo run --example fetch_tile -- '<url-template>' <cache-dir> <z> <x> <y>"
+    "usage: cargo run -p osm-loader --example fetch_tile -- '<url-template>' <cache-dir> <z> <x> <y>"
 }
