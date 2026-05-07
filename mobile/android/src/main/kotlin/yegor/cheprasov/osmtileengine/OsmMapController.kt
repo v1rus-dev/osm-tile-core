@@ -3,6 +3,7 @@ package yegor.cheprasov.osmtileengine
 import android.animation.Animator
 import android.animation.AnimatorListenerAdapter
 import android.animation.ValueAnimator
+import android.view.Choreographer
 import android.view.Surface
 import android.view.animation.DecelerateInterpolator
 import androidx.annotation.Keep
@@ -173,10 +174,18 @@ class OsmMapController private constructor(
     private var attachedSurface: Surface? = null
     private var attachedView: WeakReference<OsmMapView>? = null
     private var destroyed = false
+    private var pendingNativeCamera: OsmCamera? = null
+    private var nativeCameraFrameScheduled = false
 
     private val tileLayers = LinkedHashMap<String, TileLayerState>()
     private val internalObservers = LinkedHashMap<Any, (OsmCamera, CameraChangeReason) -> Unit>()
     private var cameraChangedListener: OnCameraChangedListener? = null
+    private val nativeCameraFrameCallback = Choreographer.FrameCallback {
+        nativeCameraFrameScheduled = false
+        val camera = pendingNativeCamera ?: return@FrameCallback
+        pendingNativeCamera = null
+        pushCameraToNative(camera)
+    }
 
     init {
         OsmNativeLibrary.ensureLoaded()
@@ -407,6 +416,7 @@ class OsmMapController private constructor(
         cameraAnimator?.cancel()
         cameraAnimator = null
         pendingFitBounds = null
+        cancelScheduledNativeCameraPush()
 
         if (surfaceReady && nativeHandle != 0L) {
             nativeSurfaceDestroyed(nativeHandle)
@@ -556,7 +566,7 @@ class OsmMapController private constructor(
         nativeSurfaceChanged(nativeHandle, surfaceWidthPx, surfaceHeightPx, surfaceDensity)
     }
 
-    private fun pushCameraToNative() {
+    private fun pushCameraToNative(camera: OsmCamera = this.camera) {
         if (nativeHandle == 0L) return
         nativeSetCamera(
             nativeHandle,
@@ -566,6 +576,22 @@ class OsmMapController private constructor(
             camera.bearing,
             camera.pitch,
         )
+    }
+
+    private fun scheduleCameraToNative(camera: OsmCamera) {
+        pendingNativeCamera = camera
+        if (nativeCameraFrameScheduled) return
+
+        nativeCameraFrameScheduled = true
+        Choreographer.getInstance().postFrameCallback(nativeCameraFrameCallback)
+    }
+
+    private fun cancelScheduledNativeCameraPush() {
+        pendingNativeCamera = null
+        if (!nativeCameraFrameScheduled) return
+
+        nativeCameraFrameScheduled = false
+        Choreographer.getInstance().removeFrameCallback(nativeCameraFrameCallback)
     }
 
     private fun applyCamera(
@@ -580,7 +606,12 @@ class OsmMapController private constructor(
         pendingFitBounds = null
         val normalized = camera.normalized()
         this.camera = normalized
-        pushCameraToNative()
+        if (reason == CameraChangeReason.GESTURE) {
+            scheduleCameraToNative(normalized)
+        } else {
+            cancelScheduledNativeCameraPush()
+            pushCameraToNative(normalized)
+        }
         dispatchCameraChanged(normalized, reason)
     }
 

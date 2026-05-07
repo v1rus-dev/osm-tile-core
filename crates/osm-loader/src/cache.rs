@@ -75,7 +75,7 @@ impl FileTileCache {
         }
     }
 
-    fn tile_path(&self, id: TileId) -> PathBuf {
+    pub fn tile_path(&self, id: TileId) -> PathBuf {
         self.root
             .join(id.z.to_string())
             .join(id.x.to_string())

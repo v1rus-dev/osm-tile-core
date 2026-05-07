@@ -9,6 +9,8 @@ use std::sync::mpsc::{self, Receiver, RecvTimeoutError, Sender, TryRecvError};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
+#[cfg(feature = "mobile")]
+use crate::mobile::OsmTileEngine;
 use image::GenericImageView;
 use jni::JNIEnv;
 use jni::objects::{JClass, JObject, JString};
@@ -16,10 +18,6 @@ use jni::sys::{jboolean, jdouble, jfloat, jint, jlong};
 use osm_core::TileId;
 use osm_loader::{CachedTileSource, FileTileCache, HttpTileSource, TileSource};
 use osm_renderer::{LayerId, MapCamera, MapLayer, RenderState, RenderViewport, TileLayer};
-use wgpu::util::DeviceExt;
-
-#[cfg(feature = "mobile")]
-use crate::mobile::OsmTileEngine;
 
 const DEFAULT_TILE_LAYER_ID: &str = "base";
 const LOG_TAG: &str = "OsmTileEngine";
@@ -68,6 +66,11 @@ const MB: usize = 1024 * 1024;
 const DEFAULT_RAM_TILE_CACHE_LIMIT_BYTES: usize = 96 * MB;
 const DEFAULT_GPU_TILE_CACHE_LIMIT_BYTES: usize = 128 * MB;
 const DEFAULT_MAX_ZOOM_DISTANCE_TO_KEEP: u8 = 2;
+const TARGET_FRAME_INTERVAL: Duration = Duration::from_millis(16);
+const CAMERA_IDLE_PREFETCH_DELAY: Duration = Duration::from_millis(250);
+const TELEMETRY_LOG_INTERVAL: Duration = Duration::from_secs(1);
+const MOVING_UPLOADS_PER_FRAME: usize = 1;
+const IDLE_UPLOADS_PER_FRAME: usize = 2;
 
 #[derive(Debug, Clone, Copy)]
 struct TileCacheLimits {
@@ -94,12 +97,23 @@ struct TileTelemetry {
     gpu_hit: u64,
     gpu_miss: u64,
     gpu_evictions: u64,
+    gpu_upload_deferred: u64,
     upload_count: u64,
     upload_time_total_ns: u128,
     fetch_count: u64,
     fetch_time_total_ns: u128,
     decode_count: u64,
     decode_time_total_ns: u128,
+    render_count: u64,
+    render_time_total_ns: u128,
+    render_visible_tiles: u64,
+    render_drawn_tiles: u64,
+    render_missing_tiles: u64,
+    camera_updates_received: u64,
+    camera_updates_applied: u64,
+    camera_updates_coalesced: u64,
+    tile_requests_enqueued: u64,
+    last_log: Option<Instant>,
 }
 
 impl TileTelemetry {
@@ -123,6 +137,34 @@ impl TileTelemetry {
     fn record_upload(&mut self, elapsed: std::time::Duration) {
         self.upload_count += 1;
         self.upload_time_total_ns += elapsed.as_nanos();
+    }
+
+    fn record_render(&mut self, elapsed: Duration, stats: RenderStats) {
+        self.render_count += 1;
+        self.render_time_total_ns += elapsed.as_nanos();
+        self.render_visible_tiles += stats.visible_tiles as u64;
+        self.render_drawn_tiles += stats.drawn_tiles as u64;
+        self.render_missing_tiles += stats.missing_tiles as u64;
+    }
+
+    fn avg_fetch_ms(&self) -> f64 {
+        avg_ms(self.fetch_time_total_ns, self.fetch_count)
+    }
+
+    fn avg_upload_ms(&self) -> f64 {
+        avg_ms(self.upload_time_total_ns, self.upload_count)
+    }
+
+    fn avg_render_ms(&self) -> f64 {
+        avg_ms(self.render_time_total_ns, self.render_count)
+    }
+}
+
+fn avg_ms(total_ns: u128, count: u64) -> f64 {
+    if count == 0 {
+        0.0
+    } else {
+        total_ns as f64 / count as f64 / 1_000_000.0
     }
 }
 
@@ -421,7 +463,6 @@ enum RenderCommand {
         id: TileId,
         tile: Option<LoadedTile>,
         error: Option<String>,
-        metadata: TileRequestMetadata,
         fetch_elapsed: Duration,
         decode_elapsed: Duration,
     },
@@ -443,7 +484,6 @@ struct FetchedTile {
 #[derive(Debug)]
 struct DecodedTileResult {
     id: TileId,
-    metadata: TileRequestMetadata,
     tile: Option<LoadedTile>,
     error: Option<String>,
     fetch_elapsed: Duration,
@@ -548,6 +588,13 @@ struct TileDrawRef<'a> {
     uv_bottom: f32,
 }
 
+#[derive(Debug, Default, Clone, Copy)]
+struct RenderStats {
+    visible_tiles: usize,
+    drawn_tiles: usize,
+    missing_tiles: usize,
+}
+
 struct RendererWorker {
     state: RenderState,
     surface_width_px: u32,
@@ -566,6 +613,7 @@ struct RendererWorker {
     telemetry: TileTelemetry,
     cache_limits: TileCacheLimits,
     last_visible_zoom: Option<u32>,
+    pending_camera: Option<MapCamera>,
     needs_render: bool,
     render_in_flight: bool,
 }
@@ -599,6 +647,8 @@ struct GpuSurface {
     tile_bind_group_layout: wgpu::BindGroupLayout,
     tile_sampler: wgpu::Sampler,
     quad_pipeline: wgpu::RenderPipeline,
+    tile_vertex_buffer: wgpu::Buffer,
+    tile_vertex_buffer_capacity_bytes: u64,
     uploaded_tiles: SizedLruCache<UploadedTile>,
     config: Option<wgpu::SurfaceConfiguration>,
     _native_window: NativeWindow,
@@ -626,11 +676,12 @@ impl RendererWorker {
             },
             frame_timing: FrameTiming {
                 last_frame: None,
-                frame_interval: Duration::from_millis(16),
+                frame_interval: TARGET_FRAME_INTERVAL,
             },
             telemetry: TileTelemetry::default(),
             cache_limits: TileCacheLimits::default(),
             last_visible_zoom: None,
+            pending_camera: None,
             needs_render: false,
             render_in_flight: false,
         }
@@ -690,23 +741,11 @@ impl RendererWorker {
                         }
                     }
                     RenderCommand::SetCamera(camera) => {
-                        log_debug(format!(
-                            "set camera lat={:.6} lon={:.6} zoom={:.2} bearing={:.2} pitch={:.2}",
-                            camera.center_lat,
-                            camera.center_lon,
-                            camera.zoom,
-                            camera.bearing,
-                            camera.pitch
-                        ));
-                        self.update_camera_velocity_hint(camera);
-                        match self.state.set_camera(camera) {
-                            Ok(()) => {
-                                self.request_generation = self.request_generation.saturating_add(1);
-                                self.update_camera_motion(camera);
-                                self.mark_needs_render();
-                            }
-                            Err(error) => log_warn(format!("failed to set camera: {error}")),
+                        self.telemetry.camera_updates_received += 1;
+                        if self.pending_camera.replace(camera).is_some() {
+                            self.telemetry.camera_updates_coalesced += 1;
                         }
+                        self.mark_needs_render();
                     }
                     RenderCommand::AddTileLayer {
                         id,
@@ -762,27 +801,15 @@ impl RendererWorker {
                         id,
                         tile,
                         error,
-                        metadata,
                         fetch_elapsed,
                         decode_elapsed,
                     } => {
-                        let is_current = self
-                            .pending_metadata
-                            .get(&id)
-                            .map(|current| current.generation == metadata.generation)
-                            .unwrap_or(false);
                         let still_relevant = self.pending_metadata.contains_key(&id);
                         self.pending_tile_loads.remove(&id);
                         if still_relevant {
                             self.telemetry.record_fetch(fetch_elapsed);
                             self.telemetry.record_decode(decode_elapsed);
                             self.pending_metadata.remove(&id);
-                            if !is_current {
-                                log_debug(format!(
-                                    "accepting stale tile z={} x={} y={} generation={} as fallback",
-                                    id.z, id.x, id.y, metadata.generation
-                                ));
-                            }
                             if let Some(error) = error {
                                 log_warn(format!(
                                     "tile z={} x={} y={} failed: {}",
@@ -791,28 +818,12 @@ impl RendererWorker {
                             }
                             if let Some(tile) = tile {
                                 let size_bytes = tile.rgba.len();
-                                log_debug(format!(
-                                    "tile z={} x={} y={} decoded {}x{} {} bytes fetch={}ms decode={}ms",
-                                    id.z,
-                                    id.x,
-                                    id.y,
-                                    tile.width,
-                                    tile.height,
-                                    size_bytes,
-                                    fetch_elapsed.as_millis(),
-                                    decode_elapsed.as_millis()
-                                ));
                                 self.loaded_tiles.insert(id, tile, size_bytes);
                                 self.telemetry.decoded_hit += 1;
                             } else {
                                 self.telemetry.decoded_miss += 1;
                             }
                             self.mark_needs_render();
-                        } else {
-                            log_debug(format!(
-                                "dropping stale tile z={} x={} y={} generation={}",
-                                id.z, id.x, id.y, metadata.generation
-                            ));
                         }
                     }
                     RenderCommand::Shutdown => {
@@ -861,8 +872,25 @@ impl RendererWorker {
 
         self.render_in_flight = true;
         self.needs_render = false;
+        self.apply_pending_camera();
         self.render_frame();
         self.render_in_flight = false;
+    }
+
+    fn apply_pending_camera(&mut self) {
+        let Some(camera) = self.pending_camera.take() else {
+            return;
+        };
+
+        self.update_camera_velocity_hint(camera);
+        match self.state.set_camera(camera) {
+            Ok(()) => {
+                self.request_generation = self.request_generation.saturating_add(1);
+                self.update_camera_motion(camera);
+                self.telemetry.camera_updates_applied += 1;
+            }
+            Err(error) => log_warn(format!("failed to set camera: {error}")),
+        }
     }
 
     fn create_gpu_surface(&mut self, window: NativeWindow, runtime: &tokio::runtime::Runtime) {
@@ -885,11 +913,8 @@ impl RendererWorker {
     }
 
     fn render_frame(&mut self) {
-        let now = Instant::now();
-        if let Some(prev) = self.frame_timing.last_frame {
-            self.frame_timing.frame_interval = now.saturating_duration_since(prev);
-        }
-        self.frame_timing.last_frame = Some(now);
+        let render_started = Instant::now();
+        self.frame_timing.last_frame = Some(render_started);
         let visible_tiles = if self.has_visible_tile_layer() {
             match self.state.visible_tiles() {
                 Ok(tiles) => Some(tiles),
@@ -909,9 +934,21 @@ impl RendererWorker {
             self.enforce_cache_limits(visible_tiles);
         }
 
+        let mut stats = visible_tiles
+            .as_ref()
+            .map(|tiles| RenderStats {
+                visible_tiles: tiles.len(),
+                ..Default::default()
+            })
+            .unwrap_or_default();
         if let Some(gpu) = self.gpu.as_mut() {
-            gpu.render(visible_tiles.as_deref());
+            if let Some(render_stats) = gpu.render(visible_tiles.as_deref()) {
+                stats = render_stats;
+            }
         }
+        self.telemetry
+            .record_render(render_started.elapsed(), stats);
+        self.log_telemetry_if_due();
     }
 
     fn ensure_visible_tiles(&mut self, visible_tiles: &[osm_renderer::VisibleTile]) {
@@ -957,32 +994,51 @@ impl RendererWorker {
                 )),
             }
         }
-        if enqueued > 0 {
-            log_debug(format!(
-                "tile plan visible={} planned={} pending={} enqueued={} budget={}",
-                visible_tiles.len(),
-                request_plan.len(),
-                self.pending_tile_loads.len(),
-                enqueued,
-                max_inflight
-            ));
-        }
+        self.telemetry.tile_requests_enqueued += enqueued as u64;
 
+        let upload_budget = self.upload_budget_per_frame();
+        let mut uploads_this_frame = 0_usize;
+        let mut deferred_uploads = 0_usize;
         for visible_tile in visible_tiles {
             let tile_id = visible_tile.id;
-            let tile_data = self.loaded_tiles.get_cloned(&tile_id);
-            if tile_data.is_some() {
+            let loaded = self.loaded_tiles.contains_key(&tile_id);
+            if loaded {
                 self.telemetry.decoded_hit += 1;
             }
 
-            if let (Some(gpu), Some(tile_data)) = (self.gpu.as_mut(), tile_data) {
-                if !gpu.uploaded_tiles.contains_key(&tile_id) {
-                    self.telemetry.gpu_miss += 1;
-                    gpu.upload_tile(tile_id, &tile_data, &mut self.telemetry);
-                } else {
+            let needs_upload = loaded
+                && self
+                    .gpu
+                    .as_ref()
+                    .map(|gpu| !gpu.uploaded_tiles.contains_key(&tile_id))
+                    .unwrap_or(false);
+            if !needs_upload {
+                if loaded && self.gpu.is_some() {
                     self.telemetry.gpu_hit += 1;
                 }
+                continue;
             }
+
+            self.telemetry.gpu_miss += 1;
+            if uploads_this_frame >= upload_budget {
+                deferred_uploads += 1;
+                continue;
+            }
+
+            let Some(tile_data) = self.loaded_tiles.get_cloned(&tile_id) else {
+                continue;
+            };
+            if let Some(gpu) = self.gpu.as_mut() {
+                if !gpu.uploaded_tiles.contains_key(&tile_id) {
+                    gpu.upload_tile(tile_id, &tile_data, &mut self.telemetry);
+                    uploads_this_frame += 1;
+                }
+            }
+        }
+
+        if deferred_uploads > 0 {
+            self.telemetry.gpu_upload_deferred += deferred_uploads as u64;
+            self.mark_needs_render();
         }
     }
 
@@ -1045,6 +1101,9 @@ impl RendererWorker {
             .unwrap_or(0);
         for tile in visible_tiles {
             plan.insert(tile.id, TilePriority::P0Visible);
+        }
+        if self.camera_is_moving() {
+            return plan;
         }
         let rings = self.dynamic_prefetch_rings();
         for ring in 1..=rings {
@@ -1129,15 +1188,64 @@ impl RendererWorker {
     }
 
     fn prefetch_budget(&self) -> usize {
-        let ms = self.frame_timing.frame_interval.as_millis();
+        if self.camera_is_moving() {
+            return 4;
+        }
+
+        let render_ms = self.telemetry.avg_render_ms();
         let decode_ms = self.telemetry.avg_decode_ms();
-        if ms > 40 || decode_ms > 14.0 {
+        if render_ms > 24.0 || decode_ms > 14.0 {
             4
-        } else if ms > 24 || decode_ms > 8.0 {
+        } else if render_ms > 16.0 || decode_ms > 8.0 {
             8
         } else {
             12
         }
+    }
+
+    fn upload_budget_per_frame(&self) -> usize {
+        if self.camera_is_moving() {
+            MOVING_UPLOADS_PER_FRAME
+        } else {
+            IDLE_UPLOADS_PER_FRAME
+        }
+    }
+
+    fn camera_is_moving(&self) -> bool {
+        self.pending_camera.is_some()
+            || self
+                .camera_motion
+                .last_update
+                .map(|updated| updated.elapsed() < CAMERA_IDLE_PREFETCH_DELAY)
+                .unwrap_or(false)
+    }
+
+    fn log_telemetry_if_due(&mut self) {
+        let now = Instant::now();
+        if let Some(last_log) = self.telemetry.last_log {
+            if now.saturating_duration_since(last_log) < TELEMETRY_LOG_INTERVAL {
+                return;
+            }
+        }
+        self.telemetry.last_log = Some(now);
+
+        log_debug(format!(
+            "renderer telemetry frames={} avg_render={:.1}ms avg_fetch={:.1}ms avg_decode={:.1}ms avg_upload={:.1}ms visible={} drawn={} missing={} uploads={} deferred={} tile_requests={} camera_recv={} applied={} coalesced={}",
+            self.telemetry.render_count,
+            self.telemetry.avg_render_ms(),
+            self.telemetry.avg_fetch_ms(),
+            self.telemetry.avg_decode_ms(),
+            self.telemetry.avg_upload_ms(),
+            self.telemetry.render_visible_tiles,
+            self.telemetry.render_drawn_tiles,
+            self.telemetry.render_missing_tiles,
+            self.telemetry.upload_count,
+            self.telemetry.gpu_upload_deferred,
+            self.telemetry.tile_requests_enqueued,
+            self.telemetry.camera_updates_received,
+            self.telemetry.camera_updates_applied,
+            self.telemetry.camera_updates_coalesced,
+        ));
     }
 
     fn tile_request_priority(
@@ -1261,7 +1369,7 @@ fn tile_loader_loop(
     commands: Sender<RenderCommand>,
     receiver: Receiver<TileLoaderRequest>,
 ) {
-    const MAX_CONCURRENT_FETCHES: usize = 8;
+    const MAX_CONCURRENT_FETCHES: usize = 4;
     const DECODE_QUEUE_BOUND: usize = 32;
 
     let runtime = match tokio::runtime::Runtime::new() {
@@ -1275,7 +1383,7 @@ fn tile_loader_loop(
     };
 
     let decode_workers = std::thread::available_parallelism()
-        .map(|cpus| usize::max(1, cpus.get() / 2))
+        .map(|cpus| usize::min(2, usize::max(1, cpus.get() / 2)))
         .unwrap_or(1);
     let (decode_tx, decode_rx) = mpsc::sync_channel::<FetchedTile>(DECODE_QUEUE_BOUND);
     let (decoded_tx, decoded_rx) = mpsc::channel::<DecodedTileResult>();
@@ -1302,7 +1410,6 @@ fn tile_loader_loop(
                 };
                 let _ = tx.send(DecodedTileResult {
                     id: fetched.request.id,
-                    metadata: fetched.request.metadata,
                     tile,
                     error,
                     fetch_elapsed: fetched.fetch_elapsed,
@@ -1328,56 +1435,42 @@ fn tile_loader_loop(
                 continue;
             }
             let source = source.clone();
-            in_flight_fetches.spawn(async move {
-                let fetch_started = Instant::now();
-                let bytes = source
-                    .load_tile(request.id)
-                    .await
-                    .map_err(|error| error.to_string());
-                match &bytes {
-                    Ok(bytes) => log_debug(format!(
-                        "tile z={} x={} y={} fetched {} bytes in {}ms",
-                        request.id.z,
-                        request.id.x,
-                        request.id.y,
-                        bytes.len(),
-                        fetch_started.elapsed().as_millis()
-                    )),
-                    Err(error) => log_warn(format!(
-                        "tile z={} x={} y={} fetch failed in {}ms: {}",
-                        request.id.z,
-                        request.id.x,
-                        request.id.y,
-                        fetch_started.elapsed().as_millis(),
-                        error
-                    )),
-                }
-                FetchedTile {
-                    request,
-                    bytes,
-                    fetch_elapsed: fetch_started.elapsed(),
-                }
-            });
+            in_flight_fetches.spawn_on(
+                async move {
+                    let fetch_started = Instant::now();
+                    let cache_path = source.cache().tile_path(request.id);
+                    let remote_url = source.source().tile_url(request.id);
+                    let bytes = source
+                        .load_tile(request.id)
+                        .await
+                        .map_err(|error| error.to_string());
+                    if let Err(error) = &bytes {
+                        log_warn(format!(
+                            "tile z={} x={} y={} fetch failed in {}ms cache_path={} remote_url={}: {}",
+                            request.id.z,
+                            request.id.x,
+                            request.id.y,
+                            fetch_started.elapsed().as_millis(),
+                            cache_path.display(),
+                            remote_url,
+                            error
+                        ));
+                    }
+                    FetchedTile {
+                        request,
+                        bytes,
+                        fetch_elapsed: fetch_started.elapsed(),
+                    }
+                },
+                runtime.handle(),
+            );
         }
 
         while let Ok(request) = receiver.recv_timeout(Duration::from_millis(2)) {
             match request {
                 TileLoaderRequest::Load(request) => {
                     if in_flight.insert(request.id) {
-                        log_debug(format!(
-                            "tile z={} x={} y={} queued priority={:.2} generation={}",
-                            request.id.z,
-                            request.id.x,
-                            request.id.y,
-                            request.priority,
-                            request.metadata.generation
-                        ));
                         queued.push(PrioritizedTileRequest(request));
-                    } else {
-                        log_debug(format!(
-                            "tile z={} x={} y={} already queued or in flight",
-                            request.id.z, request.id.x, request.id.y
-                        ));
                     }
                 }
                 TileLoaderRequest::Shutdown => {
@@ -1418,7 +1511,6 @@ fn tile_loader_loop(
                             id: result.id,
                             tile: result.tile,
                             error: result.error,
-                            metadata: result.metadata,
                             fetch_elapsed: result.fetch_elapsed,
                             decode_elapsed: result.decode_elapsed,
                         })
@@ -1485,10 +1577,9 @@ fn newest_generation(queue: &BinaryHeap<PrioritizedTileRequest>, fallback: u64) 
 
 impl GpuSurface {
     fn new(native_window: NativeWindow, runtime: &tokio::runtime::Runtime) -> Result<Self, String> {
-        let instance = wgpu::Instance::new(&wgpu::InstanceDescriptor {
-            backends: wgpu::Backends::GL,
-            ..Default::default()
-        });
+        let mut instance_descriptor = wgpu::InstanceDescriptor::new_without_display_handle();
+        instance_descriptor.backends = wgpu::Backends::GL;
+        let instance = wgpu::Instance::new(instance_descriptor);
         log_info("using OpenGL backend for Android wgpu surface");
         let raw_window_handle =
             wgpu::rwh::AndroidNdkWindowHandle::new(native_window.raw_handle()).into();
@@ -1593,6 +1684,12 @@ impl GpuSurface {
             multiview_mask: None,
             cache: None,
         });
+        let tile_vertex_buffer = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("osm-map-renderer-tile-vertex-buffer"),
+            size: 1,
+            usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
         Ok(Self {
             surface,
             _instance: instance,
@@ -1602,6 +1699,8 @@ impl GpuSurface {
             tile_bind_group_layout,
             tile_sampler,
             quad_pipeline,
+            tile_vertex_buffer,
+            tile_vertex_buffer_capacity_bytes: 1,
             uploaded_tiles: SizedLruCache::new(TileCacheLimits::default().gpu_bytes),
             config: None,
             _native_window: native_window,
@@ -1679,21 +1778,14 @@ impl GpuSurface {
             texture_size_bytes,
         );
         telemetry.record_upload(upload_started.elapsed());
-        log_debug(format!(
-            "tile z={} x={} y={} uploaded to GPU {}x{} {} bytes in {}ms",
-            tile_id.z,
-            tile_id.x,
-            tile_id.y,
-            tile.width,
-            tile.height,
-            texture_size_bytes,
-            upload_started.elapsed().as_millis()
-        ));
     }
 
-    fn render(&mut self, visible_tiles: Option<&[osm_renderer::VisibleTile]>) {
+    fn render(
+        &mut self,
+        visible_tiles: Option<&[osm_renderer::VisibleTile]>,
+    ) -> Option<RenderStats> {
         if self.config.is_none() {
-            return;
+            return None;
         }
 
         let frame = match self.surface.get_current_texture() {
@@ -1703,12 +1795,14 @@ impl GpuSurface {
                 if let Some(config) = self.config.clone() {
                     self.surface.configure(&self.device, &config);
                 }
-                return;
+                return None;
             }
-            wgpu::CurrentSurfaceTexture::Timeout | wgpu::CurrentSurfaceTexture::Occluded => return,
+            wgpu::CurrentSurfaceTexture::Timeout | wgpu::CurrentSurfaceTexture::Occluded => {
+                return None;
+            }
             wgpu::CurrentSurfaceTexture::Validation => {
                 log_error("Android wgpu surface returned a validation error");
-                return;
+                return None;
             }
         };
 
@@ -1739,10 +1833,19 @@ impl GpuSurface {
             });
         }
 
+        let mut stats = visible_tiles
+            .map(|tiles| RenderStats {
+                visible_tiles: tiles.len(),
+                ..Default::default()
+            })
+            .unwrap_or_default();
         if let Some(visible_tiles) = visible_tiles {
             let mut batch_vertices = Vec::new();
             let mut batch_draws = Vec::new();
             let mut missing_tiles = 0_usize;
+            self.ensure_tile_vertex_buffer_capacity(
+                (visible_tiles.len() * 6 * std::mem::size_of::<TexturedVertex>()) as u64,
+            );
 
             for visible_tile in visible_tiles {
                 let Some(tile_draw) = self.resolve_tile_draw(visible_tile.id) else {
@@ -1768,19 +1871,9 @@ impl GpuSurface {
             }
 
             if !batch_vertices.is_empty() {
-                log_debug(format!(
-                    "rendering tiles visible={} drawn={} missing={}",
-                    visible_tiles.len(),
-                    batch_draws.len(),
-                    missing_tiles
-                ));
-                let vertex_buffer =
-                    self.device
-                        .create_buffer_init(&wgpu::util::BufferInitDescriptor {
-                            label: Some("osm-map-renderer-tile-vertex-buffer"),
-                            contents: bytes_of(&batch_vertices),
-                            usage: wgpu::BufferUsages::VERTEX,
-                        });
+                stats.drawn_tiles = batch_draws.len();
+                stats.missing_tiles = missing_tiles;
+                self.write_tile_vertices(&batch_vertices);
                 let mut render_pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
                     label: Some("osm-map-renderer-tile-pass"),
                     color_attachments: &[Some(wgpu::RenderPassColorAttachment {
@@ -1803,21 +1896,39 @@ impl GpuSurface {
                     let vertex_end =
                         vertex_start + (6 * std::mem::size_of::<TexturedVertex>()) as u64;
                     render_pass.set_bind_group(0, bind_group, &[]);
-                    render_pass.set_vertex_buffer(0, vertex_buffer.slice(vertex_start..vertex_end));
+                    render_pass.set_vertex_buffer(
+                        0,
+                        self.tile_vertex_buffer.slice(vertex_start..vertex_end),
+                    );
                     render_pass.draw(0..6, 0..1);
                 }
-            } else if !visible_tiles.is_empty() {
-                log_debug(format!(
-                    "rendering skipped tile draw: visible={} uploaded={} missing={}",
-                    visible_tiles.len(),
-                    self.uploaded_tiles.entries.len(),
-                    missing_tiles
-                ));
+            } else {
+                stats.missing_tiles = missing_tiles;
             }
         }
 
         self.queue.submit(Some(encoder.finish()));
         frame.present();
+        Some(stats)
+    }
+
+    fn ensure_tile_vertex_buffer_capacity(&mut self, required_bytes: u64) {
+        if required_bytes > self.tile_vertex_buffer_capacity_bytes {
+            let capacity = required_bytes.next_power_of_two();
+            self.tile_vertex_buffer = self.device.create_buffer(&wgpu::BufferDescriptor {
+                label: Some("osm-map-renderer-tile-vertex-buffer"),
+                size: capacity,
+                usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST,
+                mapped_at_creation: false,
+            });
+            self.tile_vertex_buffer_capacity_bytes = capacity;
+        }
+    }
+
+    fn write_tile_vertices(&self, vertices: &[TexturedVertex]) {
+        let vertex_bytes = bytes_of(vertices);
+        self.queue
+            .write_buffer(&self.tile_vertex_buffer, 0, vertex_bytes);
     }
 
     fn resolve_tile_draw(&self, tile_id: TileId) -> Option<TileDrawRef<'_>> {
