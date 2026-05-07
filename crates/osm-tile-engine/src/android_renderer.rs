@@ -1,4 +1,4 @@
-use std::collections::{BinaryHeap, HashMap, HashSet};
+use std::collections::{HashMap, HashSet};
 use std::ffi::{CString, c_char, c_int, c_void};
 use std::path::PathBuf;
 use std::ptr::NonNull;
@@ -11,8 +11,8 @@ use std::time::{Duration, Instant};
 #[cfg(feature = "mobile")]
 use crate::mobile::OsmTileEngine;
 use crate::tile_request_queue::{
-    PrioritizedTileRequest, TileLoadRequest, TileRequestMetadata, pending_metadata_matches,
-    prune_queued_requests, queue_tile_request, rebuild_queued_requests, same_tile_request,
+    TileLoadRequest, TileRequestLane, TileRequestMetadata, TileRequestScheduler,
+    pending_metadata_matches,
 };
 use crate::tile_retention::should_evict_for_zoom;
 use image::GenericImageView;
@@ -122,6 +122,10 @@ struct TileTelemetry {
     camera_updates_applied: u64,
     camera_updates_coalesced: u64,
     tile_requests_enqueued: u64,
+    tile_requests_started: u64,
+    queued_pruned: u64,
+    queued_stale_skipped: u64,
+    queued_active_deferred: u64,
     last_log: Option<Instant>,
 }
 
@@ -476,6 +480,12 @@ enum RenderCommand {
         fetch_elapsed: Duration,
         decode_elapsed: Duration,
     },
+    TileQueueStats {
+        queued_pruned: u64,
+        queued_stale_skipped: u64,
+        queued_active_deferred: u64,
+        tile_requests_started: u64,
+    },
     Shutdown,
 }
 
@@ -483,6 +493,7 @@ enum TileLoaderRequest {
     Load(TileLoadRequest),
     RetainPlan {
         generation: u64,
+        current_zoom: u32,
         tile_ids: HashSet<TileId>,
     },
     Shutdown,
@@ -844,6 +855,17 @@ impl RendererWorker {
                             self.mark_needs_render();
                         }
                     }
+                    RenderCommand::TileQueueStats {
+                        queued_pruned,
+                        queued_stale_skipped,
+                        queued_active_deferred,
+                        tile_requests_started,
+                    } => {
+                        self.telemetry.queued_pruned += queued_pruned;
+                        self.telemetry.queued_stale_skipped += queued_stale_skipped;
+                        self.telemetry.queued_active_deferred += queued_active_deferred;
+                        self.telemetry.tile_requests_started += tile_requests_started;
+                    }
                     RenderCommand::Shutdown => {
                         log_info("renderer worker shutting down");
                         break;
@@ -991,6 +1013,10 @@ impl RendererWorker {
         self.pending_tile_priorities
             .retain(|tile_id, _| request_plan.contains(*tile_id));
 
+        let current_zoom = visible_tiles
+            .first()
+            .map(|tile| tile.id.z)
+            .unwrap_or_else(|| self.state.camera().lower_tile_zoom());
         let plan_tile_ids = request_plan
             .tiles()
             .iter()
@@ -1000,6 +1026,7 @@ impl RendererWorker {
             .tile_requests
             .send(TileLoaderRequest::RetainPlan {
                 generation: self.request_generation,
+                current_zoom,
                 tile_ids: plan_tile_ids,
             })
             .is_err()
@@ -1041,6 +1068,8 @@ impl RendererWorker {
                 .send(TileLoaderRequest::Load(TileLoadRequest {
                     id: tile_id,
                     metadata,
+                    lane: self.tile_request_lane(tile_id, priority, current_zoom),
+                    plan_priority: priority,
                     priority: self.tile_request_priority(tile_id, priority, visible_tiles),
                 })) {
                 Ok(()) => enqueued += 1,
@@ -1212,7 +1241,7 @@ impl RendererWorker {
         self.telemetry.last_log = Some(now);
 
         log_debug(format!(
-            "renderer telemetry frames={} avg_render={:.1}ms avg_fetch={:.1}ms avg_decode={:.1}ms avg_upload={:.1}ms visible={} drawn={} missing={} uploads={} deferred={} tile_requests={} camera_recv={} applied={} coalesced={}",
+            "renderer telemetry frames={} avg_render={:.1}ms avg_fetch={:.1}ms avg_decode={:.1}ms avg_upload={:.1}ms visible={} drawn={} missing={} uploads={} deferred={} tile_requests={} started={} pruned={} stale_skipped={} active_deferred={} camera_recv={} applied={} coalesced={}",
             self.telemetry.render_count,
             self.telemetry.avg_render_ms(),
             self.telemetry.avg_fetch_ms(),
@@ -1224,10 +1253,35 @@ impl RendererWorker {
             self.telemetry.upload_count,
             self.telemetry.gpu_upload_deferred,
             self.telemetry.tile_requests_enqueued,
+            self.telemetry.tile_requests_started,
+            self.telemetry.queued_pruned,
+            self.telemetry.queued_stale_skipped,
+            self.telemetry.queued_active_deferred,
             self.telemetry.camera_updates_received,
             self.telemetry.camera_updates_applied,
             self.telemetry.camera_updates_coalesced,
         ));
+    }
+
+    fn tile_request_lane(
+        &self,
+        tile_id: TileId,
+        priority: TilePlanPriority,
+        current_zoom: u32,
+    ) -> TileRequestLane {
+        match priority {
+            TilePlanPriority::Visible if tile_id.z == current_zoom => {
+                TileRequestLane::VisibleCurrentZoom
+            }
+            TilePlanPriority::Fallback if tile_id.z < current_zoom => {
+                TileRequestLane::FallbackParent
+            }
+            TilePlanPriority::LookAhead => TileRequestLane::LookAheadCurrentZoom,
+            TilePlanPriority::Periphery => TileRequestLane::PeripheryCurrentZoom,
+            TilePlanPriority::Child => TileRequestLane::ChildPrefetch,
+            TilePlanPriority::Visible => TileRequestLane::VisibleCurrentZoom,
+            TilePlanPriority::Fallback => TileRequestLane::FallbackParent,
+        }
     }
 
     fn tile_request_priority(
@@ -1489,29 +1543,21 @@ fn tile_loader_loop(
         }));
     }
 
-    let mut queued: BinaryHeap<PrioritizedTileRequest> = BinaryHeap::new();
-    let mut queued_best = HashMap::<TileId, TileLoadRequest>::new();
+    let mut scheduler = TileRequestScheduler::new();
     let mut active_fetches = HashSet::new();
     let mut in_flight_fetches = tokio::task::JoinSet::new();
     let mut shutting_down = false;
 
     loop {
+        let mut queued_pruned = 0_u64;
+        let mut tile_requests_started = 0_u64;
         while in_flight_fetches.len() < MAX_CONCURRENT_FETCHES {
-            let Some(request) = queued.pop() else { break };
-            let request = request.0;
-            if queued_best
-                .get(&request.id)
-                .map(|best| !same_tile_request(*best, request))
-                .unwrap_or(true)
-            {
-                continue;
-            }
-            if active_fetches.contains(&request.id) {
-                continue;
-            }
-            queued_best.remove(&request.id);
+            let Some(request) = scheduler.pop_next(&active_fetches) else {
+                break;
+            };
             let source = source.clone();
             active_fetches.insert(request.id);
+            tile_requests_started += 1;
             in_flight_fetches.spawn_on(
                 async move {
                     let fetch_started = Instant::now();
@@ -1546,18 +1592,18 @@ fn tile_loader_loop(
         while let Ok(request) = receiver.recv_timeout(Duration::from_millis(2)) {
             match request {
                 TileLoaderRequest::Load(request) => {
-                    queue_tile_request(&mut queued, &mut queued_best, request);
+                    scheduler.queue(request);
                 }
                 TileLoaderRequest::RetainPlan {
                     generation,
+                    current_zoom,
                     tile_ids,
                 } => {
-                    prune_queued_requests(&mut queued_best, &tile_ids);
-                    rebuild_queued_requests(&mut queued, &queued_best);
+                    let pruned = scheduler.retain_plan(generation, current_zoom, tile_ids);
+                    queued_pruned += pruned as u64;
                     log_debug(format!(
-                        "tile loader pruned queued requests generation={} retained={}",
-                        generation,
-                        tile_ids.len()
+                        "tile loader pruned queued requests generation={} current_zoom={} pruned={}",
+                        generation, current_zoom, pruned
                     ));
                 }
                 TileLoaderRequest::Shutdown => {
@@ -1584,9 +1630,7 @@ fn tile_loader_loop(
             match decoded_rx.try_recv() {
                 Ok(result) => {
                     active_fetches.remove(&result.id);
-                    if let Some(request) = queued_best.get(&result.id).copied() {
-                        queued.push(PrioritizedTileRequest(request));
-                    }
+                    scheduler.requeue_best_for_tile(result.id);
                     if result.tile.is_none() {
                         let cache = source.cache().clone();
                         if let Err(error) = runtime.block_on(cache.remove(result.id)) {
@@ -1615,12 +1659,23 @@ fn tile_loader_loop(
             }
         }
 
-        if queued.len() > queued_best.len().saturating_mul(4).saturating_add(32) {
-            rebuild_queued_requests(&mut queued, &queued_best);
+        scheduler.rebuild_if_fragmented();
+        let scheduler_stats = scheduler.drain_stats();
+        if queued_pruned > 0
+            || scheduler_stats.queued_stale_skipped > 0
+            || scheduler_stats.queued_active_deferred > 0
+            || tile_requests_started > 0
+        {
+            let _ = commands.send(RenderCommand::TileQueueStats {
+                queued_pruned,
+                queued_stale_skipped: scheduler_stats.queued_stale_skipped,
+                queued_active_deferred: scheduler_stats.queued_active_deferred,
+                tile_requests_started,
+            });
         }
 
         if shutting_down
-            && queued.is_empty()
+            && scheduler.is_empty()
             && in_flight_fetches.is_empty()
             && active_fetches.is_empty()
         {
@@ -2190,39 +2245,10 @@ mod tests {
         TileLoadRequest {
             id,
             metadata: TileRequestMetadata { generation },
+            lane: TileRequestLane::VisibleCurrentZoom,
+            plan_priority: TilePlanPriority::Visible,
             priority,
         }
-    }
-
-    #[test]
-    fn queue_tile_request_keeps_best_request_per_tile() {
-        let id = tile(4, 8, 8);
-        let mut queued = BinaryHeap::new();
-        let mut queued_best = HashMap::new();
-
-        queue_tile_request(&mut queued, &mut queued_best, request(id, 1, 1_000.0));
-        queue_tile_request(&mut queued, &mut queued_best, request(id, 1, 5_000.0));
-        queue_tile_request(&mut queued, &mut queued_best, request(id, 2, 3_000.0));
-
-        assert!(same_tile_request(
-            *queued_best.get(&id).unwrap(),
-            request(id, 1, 5_000.0)
-        ));
-    }
-
-    #[test]
-    fn queue_tile_request_replaces_equal_priority_with_newer_generation() {
-        let id = tile(4, 8, 8);
-        let mut queued = BinaryHeap::new();
-        let mut queued_best = HashMap::new();
-
-        queue_tile_request(&mut queued, &mut queued_best, request(id, 1, 5_000.0));
-        queue_tile_request(&mut queued, &mut queued_best, request(id, 2, 5_000.0));
-
-        assert!(same_tile_request(
-            *queued_best.get(&id).unwrap(),
-            request(id, 2, 5_000.0)
-        ));
     }
 
     #[test]
@@ -2322,29 +2348,29 @@ mod tests {
     #[test]
     fn active_tile_keeps_newer_queued_request_for_later() {
         let id = tile(4, 8, 8);
-        let mut queued = BinaryHeap::new();
-        let mut queued_best = HashMap::new();
+        let mut scheduler = TileRequestScheduler::new();
         let mut active_fetches = HashSet::new();
 
-        queue_tile_request(&mut queued, &mut queued_best, request(id, 1, 4_000.0));
-        let first = queued.pop().unwrap().0;
-        queued_best.remove(&first.id);
+        scheduler.retain_plan(1, 4, HashSet::from([id]));
+        scheduler.queue(request(id, 1, 4_000.0));
+        let first = scheduler.pop_next(&active_fetches).unwrap();
         active_fetches.insert(first.id);
 
-        queue_tile_request(&mut queued, &mut queued_best, request(id, 2, 5_000.0));
-        let active_duplicate = queued.pop().unwrap().0;
-        assert!(active_fetches.contains(&active_duplicate.id));
-        assert!(queued_best.contains_key(&active_duplicate.id));
+        scheduler.retain_plan(2, 4, HashSet::from([id]));
+        scheduler.queue(request(id, 2, 5_000.0));
+        assert!(scheduler.pop_next(&active_fetches).is_none());
 
         active_fetches.remove(&id);
-        if let Some(request) = queued_best.get(&id).copied() {
-            queued.push(PrioritizedTileRequest(request));
-        }
+        scheduler.requeue_best_for_tile(id);
 
-        assert!(same_tile_request(
-            queued.pop().unwrap().0,
-            request(id, 2, 5_000.0)
-        ));
+        assert_eq!(
+            scheduler
+                .pop_next(&active_fetches)
+                .unwrap()
+                .metadata
+                .generation,
+            2
+        );
     }
 
     #[test]
