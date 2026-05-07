@@ -1,8 +1,10 @@
-use osm_core::{GeoPoint, MapProjection, TileId};
+use osm_core::{
+    tile_count_per_axis, GeoPoint, MapProjection, TileId, MAX_ZOOM, MIN_ZOOM, TILE_SIZE_PX,
+};
 
 use crate::RenderError;
 
-pub const TILE_SIZE_PX: f64 = 256.0;
+const CAMERA_ZOOM_OVERSHOOT: f64 = 1.0;
 
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct MapCamera {
@@ -26,10 +28,12 @@ impl MapCamera {
     }
 
     pub fn validate(self) -> Result<Self, RenderError> {
-        if !self.zoom.is_finite() || self.zoom < 0.0 || self.zoom > TileId::MAX_ZOOM as f64 {
+        let min_zoom = MIN_ZOOM as f64 - CAMERA_ZOOM_OVERSHOOT;
+        let max_zoom = MAX_ZOOM as f64 + CAMERA_ZOOM_OVERSHOOT;
+        if !self.zoom.is_finite() || self.zoom < min_zoom || self.zoom > max_zoom {
             return Err(RenderError::InvalidCameraZoom {
                 zoom: self.zoom,
-                max: TileId::MAX_ZOOM,
+                max: MAX_ZOOM,
             });
         }
         if !self.bearing.is_finite() {
@@ -49,8 +53,12 @@ impl MapCamera {
         Ok(self)
     }
 
+    pub fn lower_tile_zoom(self) -> u32 {
+        self.zoom.floor().clamp(MIN_ZOOM as f64, MAX_ZOOM as f64) as u32
+    }
+
     pub fn tile_zoom(self) -> u32 {
-        self.zoom.floor().clamp(0.0, TileId::MAX_ZOOM as f64) as u32
+        self.lower_tile_zoom()
     }
 }
 
@@ -114,7 +122,7 @@ pub fn visible_tiles(
 ) -> Result<Vec<VisibleTile>, RenderError> {
     let camera = camera.validate()?;
     let viewport = viewport.validate()?;
-    let zoom = camera.tile_zoom();
+    let zoom = camera.lower_tile_zoom();
     let scale = 2_f64.powf(camera.zoom - zoom as f64);
     let center = GeoPoint::new(camera.center_lat, camera.center_lon)?;
     let (center_x, center_y) = MapProjection::WebMercator.project_to_world_pixels(center, zoom)?;
@@ -125,7 +133,7 @@ pub fn visible_tiles(
     let max_tile_x = ((center_x + half_width_world_px) / TILE_SIZE_PX).floor() as i64;
     let min_tile_y = ((center_y - half_height_world_px) / TILE_SIZE_PX).floor() as i64;
     let max_tile_y = ((center_y + half_height_world_px) / TILE_SIZE_PX).floor() as i64;
-    let limit = 1_i64 << zoom;
+    let limit = i64::from(tile_count_per_axis(zoom)?);
     let mut tiles = Vec::new();
     let half_width_screen_px = viewport.width_px as f64 / 2.0;
     let half_height_screen_px = viewport.height_px as f64 / 2.0;
@@ -174,7 +182,7 @@ pub fn position_tile(
     let center = GeoPoint::new(camera.center_lat, camera.center_lon)?;
     let (center_x, center_y) =
         MapProjection::WebMercator.project_to_world_pixels(center, tile_id.z)?;
-    let limit = 1_i64 << tile_id.z;
+    let limit = i64::from(tile_count_per_axis(tile_id.z)?);
     let center_tile_x = center_x / TILE_SIZE_PX;
     let base_x = tile_id.x as i64;
     let wrapped_x = [base_x - limit, base_x, base_x + limit]
@@ -235,8 +243,31 @@ mod tests {
         let viewport = RenderViewport::new(256, 256, 1.0).unwrap();
         let tiles = visible_tiles(camera, viewport).unwrap();
 
+        assert_eq!(camera.lower_tile_zoom(), 3);
         assert!(tiles.iter().all(|tile| tile.id.z == 3));
         assert!(!tiles.is_empty());
+    }
+
+    #[test]
+    fn transient_zoom_below_min_uses_min_tile_zoom_with_smaller_scale() {
+        let camera = MapCamera::new(0.0, 0.0, -0.25).unwrap();
+        let viewport = RenderViewport::new(256, 256, 1.0).unwrap();
+        let tiles = visible_tiles(camera, viewport).unwrap();
+
+        assert_eq!(camera.lower_tile_zoom(), MIN_ZOOM);
+        assert!(tiles.iter().all(|tile| tile.id.z == MIN_ZOOM));
+        assert!(tiles.iter().all(|tile| tile.size_px < 256.0));
+    }
+
+    #[test]
+    fn transient_zoom_above_max_uses_max_tile_zoom_with_larger_scale() {
+        let camera = MapCamera::new(0.0, 0.0, MAX_ZOOM as f64 + 0.25).unwrap();
+        let viewport = RenderViewport::new(256, 256, 1.0).unwrap();
+        let tiles = visible_tiles(camera, viewport).unwrap();
+
+        assert_eq!(camera.lower_tile_zoom(), MAX_ZOOM);
+        assert!(tiles.iter().all(|tile| tile.id.z == MAX_ZOOM));
+        assert!(tiles.iter().all(|tile| tile.size_px > 256.0));
     }
 
     #[test]
@@ -256,7 +287,11 @@ mod tests {
             Err(RenderError::InvalidRenderViewport { .. })
         ));
         assert!(matches!(
-            MapCamera::new(0.0, 0.0, TileId::MAX_ZOOM as f64 + 1.0),
+            MapCamera::new(0.0, 0.0, TileId::MAX_ZOOM as f64 + 2.0),
+            Err(RenderError::InvalidCameraZoom { .. })
+        ));
+        assert!(matches!(
+            MapCamera::new(0.0, 0.0, MIN_ZOOM as f64 - 2.0),
             Err(RenderError::InvalidCameraZoom { .. })
         ));
     }

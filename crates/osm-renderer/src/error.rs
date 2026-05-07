@@ -68,6 +68,7 @@ impl From<CoreError> for RenderError {
     fn from(error: CoreError) -> Self {
         match error {
             CoreError::InvalidZoom { z, max } => Self::InvalidZoom { z, max },
+            CoreError::InvalidContinuousZoom { zoom, max } => Self::InvalidCameraZoom { zoom, max },
             CoreError::InvalidTileCoordinate { z, x, y, limit } => {
                 Self::InvalidTileCoordinate { z, x, y, limit }
             }

@@ -1,4 +1,4 @@
-use osm_core::{GeoPoint, TileId, validate_latitude, validate_longitude};
+use osm_core::{GeoPoint, validate_latitude, validate_longitude, validate_zoom_level};
 
 use crate::TileError;
 
@@ -78,19 +78,13 @@ pub struct MarkerCluster {
 }
 
 fn validate_marker_zoom(zoom: u32) -> Result<(), TileError> {
-    if zoom > TileId::MAX_ZOOM {
-        return Err(TileError::InvalidZoom {
-            z: zoom,
-            max: TileId::MAX_ZOOM,
-        });
-    }
-
-    Ok(())
+    validate_zoom_level(zoom).map_err(TileError::from)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use osm_core::TileId;
 
     #[test]
     fn validates_marker_fields() {

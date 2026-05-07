@@ -17,8 +17,9 @@ import android.widget.FrameLayout
 import android.widget.LinearLayout
 import android.widget.TextView
 import androidx.annotation.Keep
-import kotlin.math.ln
+import kotlin.math.abs
 import kotlin.math.exp
+import kotlin.math.ln
 import java.util.Locale
 
 @Keep
@@ -47,6 +48,11 @@ class OsmMapView @JvmOverloads constructor(
         val durationMs: Long = 180L,
     )
 
+    data class ZoomSnapConfig(
+        val enabled: Boolean = true,
+        val durationMs: Long = 180L,
+    )
+
     private var surfaceReady = false
     private var surfaceWidth = 0
     private var surfaceHeight = 0
@@ -67,6 +73,8 @@ class OsmMapView @JvmOverloads constructor(
     private var flingLastFrameNs = 0L
     private var flingRunning = false
     private var doubleTapZoomConfig = DoubleTapZoomConfig()
+    private var zoomSnapConfig = ZoomSnapConfig()
+    private var zoomLimitConfigOverride: ZoomLimitConfig? = null
 
     private var tileUrlTemplate: String = ""
     private var cacheDir: String = context.filesDir.resolve(DEFAULT_CACHE_DIR).absolutePath
@@ -97,6 +105,10 @@ class OsmMapView @JvmOverloads constructor(
             override fun onScale(detector: ScaleGestureDetector): Boolean {
                 zoomBy(detector.scaleFactor.toDouble(), detector.focusX, detector.focusY)
                 return true
+            }
+
+            override fun onScaleEnd(detector: ScaleGestureDetector) {
+                snapZoomAfterGesture()
             }
         },
     )
@@ -341,6 +353,15 @@ class OsmMapView @JvmOverloads constructor(
 
     fun stopAnimation() {
         getController()?.stopAnimation()
+    }
+
+    fun snapZoom() {
+        snapZoom(zoomSnapConfig.durationMs)
+    }
+
+    fun snapZoom(durationMs: Long) {
+        require(durationMs >= 0L) { "Zoom snap duration must be non-negative" }
+        ensureActiveController().snapZoom(durationMs)
     }
 
     fun addTileLayer(
@@ -593,6 +614,21 @@ class OsmMapView @JvmOverloads constructor(
 
     fun getDoubleTapZoomDelta(): Double = doubleTapZoomConfig.zoomDelta
 
+    fun setZoomSnapConfig(config: ZoomSnapConfig) {
+        require(config.durationMs >= 0L) { "Zoom snap duration must be non-negative" }
+        zoomSnapConfig = config
+    }
+
+    fun getZoomSnapConfig(): ZoomSnapConfig = zoomSnapConfig
+
+    fun setZoomLimitConfig(config: ZoomLimitConfig) {
+        ensureActiveController().setZoomLimitConfig(config)
+        zoomLimitConfigOverride = config
+    }
+
+    fun getZoomLimitConfig(): ZoomLimitConfig =
+        zoomLimitConfigOverride ?: getController()?.getZoomLimitConfig() ?: ZoomLimitConfig()
+
     private fun startFling(velocityX: Float, velocityY: Float) {
         val speedX = velocityX * flingConfig.velocityMultiplier
         val speedY = velocityY * flingConfig.velocityMultiplier
@@ -652,7 +688,7 @@ class OsmMapView @JvmOverloads constructor(
 
         val controller = ensureActiveController()
         val camera = controller.getCamera()
-        val newZoom = (camera.zoom + zoomDelta).coerceIn(MIN_ZOOM, MAX_ZOOM)
+        val newZoom = controller.clampGestureZoom(camera.zoom + zoomDelta)
         if (newZoom == camera.zoom) return
 
         val oldWorldSize = worldSizePx(camera.zoom)
@@ -692,7 +728,13 @@ class OsmMapView @JvmOverloads constructor(
         val tapNormY =
             ((latitudeToNormalizedY(camera.centerLat) * oldWorldSize + (tapY - halfHeight)) /
                 oldWorldSize).coerceIn(0.0, 1.0)
-        val targetZoom = (camera.zoom + doubleTapZoomConfig.zoomDelta).coerceIn(MIN_ZOOM, MAX_ZOOM)
+        val continuousTargetZoom =
+            controller.clampSettledZoom(camera.zoom + doubleTapZoomConfig.zoomDelta)
+        val targetZoom = if (zoomSnapConfig.enabled) {
+            controller.nearestSettledZoomLevel(continuousTargetZoom)
+        } else {
+            continuousTargetZoom
+        }
 
         controller.animateCamera(
             camera.copy(
@@ -703,6 +745,17 @@ class OsmMapView @JvmOverloads constructor(
             doubleTapZoomConfig.durationMs,
             CameraChangeReason.GESTURE,
         )
+    }
+
+    private fun snapZoomAfterGesture() {
+        if (!zoomSnapConfig.enabled) return
+
+        val controller = getController() ?: return
+        val camera = controller.getCamera()
+        val targetZoom = controller.nearestSettledZoomLevel(camera.zoom)
+        if (abs(targetZoom - camera.zoom) < 0.000_001) return
+
+        controller.snapZoom(zoomSnapConfig.durationMs, CameraChangeReason.GESTURE)
     }
 
     private fun ensureActiveController(): OsmMapController {
@@ -729,6 +782,7 @@ class OsmMapView @JvmOverloads constructor(
             return
         }
 
+        zoomLimitConfigOverride?.let(controller::setZoomLimitConfig)
         controller.attachToView(this)
         controller.addInternalCameraObserver(this) { camera, _ ->
             defaultCamera = camera

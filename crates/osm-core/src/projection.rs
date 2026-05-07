@@ -1,6 +1,5 @@
-use crate::{CoreError, GeoPoint, TileId};
+use crate::{CoreError, GeoPoint, zoom::validate_zoom_level, zoom::world_size_px_at_level};
 
-pub const TILE_SIZE_PX: f64 = 256.0;
 pub const WEB_MERCATOR_MAX_LAT: f64 = 85.051_128_78;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -15,39 +14,32 @@ impl MapProjection {
         zoom: u32,
     ) -> Result<(f64, f64), CoreError> {
         point.validate()?;
-        validate_zoom(zoom)?;
+        validate_zoom_level(zoom)?;
 
         match self {
-            Self::WebMercator => Ok(project_web_mercator_to_world_pixels(point, zoom)),
+            Self::WebMercator => project_web_mercator_to_world_pixels(point, zoom),
         }
     }
 }
 
-fn project_web_mercator_to_world_pixels(point: GeoPoint, zoom: u32) -> (f64, f64) {
+fn project_web_mercator_to_world_pixels(
+    point: GeoPoint,
+    zoom: u32,
+) -> Result<(f64, f64), CoreError> {
     let lat = point.lat.clamp(-WEB_MERCATOR_MAX_LAT, WEB_MERCATOR_MAX_LAT);
-    let world_size = TILE_SIZE_PX * 2_f64.powi(zoom as i32);
+    let world_size = world_size_px_at_level(zoom)?;
     let x = (point.lon + 180.0) / 360.0 * world_size;
     let lat_rad = lat.to_radians();
     let y = (1.0 - ((lat_rad.tan() + 1.0 / lat_rad.cos()).ln() / std::f64::consts::PI)) / 2.0
         * world_size;
 
-    (x, y)
-}
-
-fn validate_zoom(zoom: u32) -> Result<(), CoreError> {
-    if zoom > TileId::MAX_ZOOM {
-        return Err(CoreError::InvalidZoom {
-            z: zoom,
-            max: TileId::MAX_ZOOM,
-        });
-    }
-
-    Ok(())
+    Ok((x, y))
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::TileId;
 
     #[test]
     fn projects_origin_to_middle_of_world_at_zero_zoom() {

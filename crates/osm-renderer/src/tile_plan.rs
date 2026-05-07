@@ -1,6 +1,6 @@
 use std::collections::HashMap;
 
-use osm_core::TileId;
+use osm_core::{MAX_ZOOM, TileId, tile_count_per_axis};
 
 use crate::VisibleTile;
 
@@ -23,7 +23,7 @@ impl Default for TilePlanOptions {
         Self {
             moving: false,
             velocity_tiles_per_sec: (0.0, 0.0),
-            parent_fallback_levels: TileId::MAX_ZOOM,
+            parent_fallback_levels: MAX_ZOOM,
             offscreen_buffer_multiplier: 1.5,
             idle_child_prefetch_levels: 1,
             zoom_fraction: 0.0,
@@ -123,7 +123,7 @@ struct TileBounds {
 impl TileBounds {
     fn from_visible_tiles(visible_tiles: &[VisibleTile]) -> Option<Self> {
         let zoom = visible_tiles.first()?.id.z;
-        let limit = 1_i64 << zoom;
+        let limit = i64::from(tile_count_per_axis(zoom).ok()?);
         let base_x = visible_tiles.first()?.id.x as i64;
         let mut min_x = i64::MAX;
         let mut max_x = i64::MIN;
@@ -291,7 +291,7 @@ fn add_children(
             let Some(child_zoom) = tile.id.z.checked_add(level) else {
                 continue;
             };
-            if child_zoom > TileId::MAX_ZOOM {
+            if child_zoom > MAX_ZOOM {
                 continue;
             }
             let scale = 1_u32 << level;
@@ -309,7 +309,7 @@ fn add_children(
 }
 
 fn tile_at(zoom: u32, x: i64, y: i64) -> Option<TileId> {
-    let limit = 1_i64 << zoom;
+    let limit = i64::from(tile_count_per_axis(zoom).ok()?);
     if y < 0 || y >= limit {
         return None;
     }

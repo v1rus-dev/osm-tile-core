@@ -1,8 +1,9 @@
 use std::collections::HashMap;
 
 use crate::{
-    MapProjection, Marker, MarkerCluster, MarkerId, MarkerRenderItem, TileError, TileId, Viewport,
+    MapProjection, Marker, MarkerCluster, MarkerId, MarkerRenderItem, TileError, Viewport,
 };
+use osm_core::validate_zoom_level;
 
 pub const DEFAULT_CLUSTER_RADIUS_PX: f64 = 64.0;
 #[derive(Debug, Clone)]
@@ -210,14 +211,7 @@ fn cluster_markers(
 }
 
 fn validate_zoom(zoom: u32) -> Result<(), TileError> {
-    if zoom > TileId::MAX_ZOOM {
-        return Err(TileError::InvalidZoom {
-            z: zoom,
-            max: TileId::MAX_ZOOM,
-        });
-    }
-
-    Ok(())
+    validate_zoom_level(zoom).map_err(TileError::from)
 }
 
 fn validate_cluster_radius(radius: f64) -> Result<(), TileError> {

@@ -7,6 +7,9 @@ pub enum TileLoadError {
     #[error("invalid zoom {z}; max supported zoom is {max}")]
     InvalidZoom { z: u32, max: u32 },
 
+    #[error("invalid continuous zoom {zoom}; expected value in 0.0..={max}")]
+    InvalidContinuousZoom { zoom: f64, max: u32 },
+
     #[error(
         "invalid tile coordinate for z={z}: x={x}, y={y}; coordinates must be less than {limit}"
     )]
@@ -46,6 +49,9 @@ impl From<CoreError> for TileLoadError {
     fn from(error: CoreError) -> Self {
         match error {
             CoreError::InvalidZoom { z, max } => Self::InvalidZoom { z, max },
+            CoreError::InvalidContinuousZoom { zoom, max } => {
+                Self::InvalidContinuousZoom { zoom, max }
+            }
             CoreError::InvalidTileCoordinate { z, x, y, limit } => {
                 Self::InvalidTileCoordinate { z, x, y, limit }
             }

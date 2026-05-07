@@ -61,15 +61,21 @@ val mapView = OsmMapView(context).apply {
     setTileUrlTemplate("http://10.0.2.2:8080/tile/{z}/{x}/{y}.png")
     setCacheDir(context.filesDir.resolve("tile-cache").path)
     setCamera(centerLat = 53.9023, centerLon = 27.5619, zoom = 12.0)
+    setZoomSnapConfig(OsmMapView.ZoomSnapConfig(enabled = true, durationMs = 180L))
     addTileLayer(layerId = "base")
 }
 ```
 
 `OsmMapView` currently provides the Android/JNI renderer skeleton: it creates a
 native renderer thread, forwards `SurfaceView` lifecycle events, handles drag and
-pinch gestures, keeps an ordered typed layer stack, and loads visible raster
-tiles through the existing cache-first loader. The final `wgpu::Surface` binding
-and tile quad presentation are the next renderer step.
+pinch gestures, snaps gesture zoom to the nearest OSM integer zoom level with an
+animation, keeps an ordered typed layer stack, and loads visible raster tiles
+through the existing cache-first loader. Programmatic camera updates keep the
+exact zoom passed by the caller unless `snapZoom()` is called explicitly.
+
+Marker and layer zoom thresholds are integer semantic zoom levels. Gesture zoom
+can be fractional while the user is interacting, but visibility policy should be
+based on the settled snapped zoom level.
 
 ## iOS
 

@@ -1113,7 +1113,7 @@ impl RendererWorker {
         ) {
             let dt = now.saturating_duration_since(last_update).as_secs_f64();
             if dt > 0.0 {
-                let zoom = camera.tile_zoom();
+                let zoom = camera.lower_tile_zoom();
                 let prev = osm_core::GeoPoint::new(last_camera.center_lat, last_camera.center_lon);
                 let curr = osm_core::GeoPoint::new(camera.center_lat, camera.center_lon);
                 if let (Ok(prev), Ok(curr)) = (prev, curr)
@@ -1138,7 +1138,7 @@ impl RendererWorker {
             TilePlanOptions {
                 moving: self.camera_is_moving(),
                 velocity_tiles_per_sec: self.camera_motion.velocity_tiles_per_sec,
-                zoom_fraction: self.state.camera().zoom.fract(),
+                zoom_fraction: osm_core::zoom_fraction(self.state.camera().zoom).unwrap_or(0.0),
                 ..TilePlanOptions::default()
             },
         )
@@ -1407,7 +1407,7 @@ impl RendererWorker {
             return false;
         };
         let camera = self.state.camera();
-        let current_zoom = camera.tile_zoom();
+        let current_zoom = camera.lower_tile_zoom();
         if tile_id.z.abs_diff(current_zoom)
             > u32::from(self.cache_limits.max_zoom_distance_to_keep).saturating_add(1)
         {

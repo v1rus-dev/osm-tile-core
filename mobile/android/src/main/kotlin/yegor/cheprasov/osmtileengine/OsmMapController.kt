@@ -22,6 +22,7 @@ internal const val MIN_LAT = -85.05112878
 internal const val MAX_LAT = 85.05112878
 internal const val MIN_ZOOM = 0.0
 internal const val MAX_ZOOM = 30.0
+internal const val MAX_TRANSIENT_ZOOM_OVERSHOOT = 1.0
 internal const val MAX_PITCH = 85.0
 
 @Keep
@@ -53,6 +54,18 @@ enum class CameraChangeReason {
     PROGRAMMATIC,
     RESTORE,
 }
+
+@Keep
+enum class MinimumZoomMode {
+    COVER_VIEWPORT,
+    FIT_WIDTH,
+}
+
+@Keep
+data class ZoomLimitConfig(
+    val minimumMode: MinimumZoomMode = MinimumZoomMode.COVER_VIEWPORT,
+    val rubberBandZoom: Double = 0.35,
+)
 
 @Keep
 fun interface OnCameraChangedListener {
@@ -104,6 +117,12 @@ internal fun wrapWorldCoordinate(value: Double, worldSize: Double): Double {
 
 internal fun worldSizePx(zoom: Double): Double = TILE_SIZE_PX * 2.0.pow(zoom)
 
+internal fun nearestZoomLevel(zoom: Double): Double =
+    floor(zoom + 0.5).coerceIn(MIN_ZOOM, MAX_ZOOM)
+
+internal fun nearestZoomLevel(zoom: Double, minZoom: Double, maxZoom: Double): Double =
+    floor(zoom + 0.5).coerceIn(minZoom, maxZoom)
+
 internal fun OsmCoordinate.normalized(): OsmCoordinate {
     require(lat.isFinite()) { "Coordinate latitude must be finite" }
     require(lon.isFinite()) { "Coordinate longitude must be finite" }
@@ -133,7 +152,10 @@ internal fun OsmCamera.normalized(): OsmCamera =
     copy(
         centerLat = centerLat.coerceIn(MIN_LAT, MAX_LAT),
         centerLon = wrapLongitude(centerLon),
-        zoom = zoom.coerceIn(MIN_ZOOM, MAX_ZOOM),
+        zoom = zoom.coerceIn(
+            MIN_ZOOM - MAX_TRANSIENT_ZOOM_OVERSHOOT,
+            MAX_ZOOM + MAX_TRANSIENT_ZOOM_OVERSHOOT,
+        ),
         pitch = pitch.coerceIn(0.0, MAX_PITCH),
     )
 
@@ -171,6 +193,8 @@ class OsmMapController private constructor(
     private var surfaceWidthPx = 0
     private var surfaceHeightPx = 0
     private var surfaceDensity = 1f
+    private var settledMinZoom = MIN_ZOOM
+    private var zoomLimitConfig = ZoomLimitConfig()
     private var attachedSurface: Surface? = null
     private var attachedView: WeakReference<OsmMapView>? = null
     private var destroyed = false
@@ -212,6 +236,40 @@ class OsmMapController private constructor(
 
     fun getEngine(): OsmTileEngine = engine
 
+    fun setZoomLimitConfig(config: ZoomLimitConfig) {
+        ensureNotDestroyed()
+        validateZoomLimitConfig(config)
+        if (zoomLimitConfig == config) return
+
+        zoomLimitConfig = config
+        refreshViewportZoomLimits()
+        reconcileCameraWithSettledBounds(CameraChangeReason.RESTORE)
+    }
+
+    fun getZoomLimitConfig(): ZoomLimitConfig = zoomLimitConfig
+
+    fun getSettledMinZoom(): Double = settledMinZoom
+
+    fun getSettledMaxZoom(): Double = MAX_ZOOM
+
+    internal fun clampSettledZoom(zoom: Double): Double =
+        zoom.coerceIn(settledMinZoom, MAX_ZOOM)
+
+    internal fun clampGestureZoom(zoom: Double): Double {
+        val overshoot = zoomLimitConfig.rubberBandZoom
+        val minGestureZoom = when (zoomLimitConfig.minimumMode) {
+            MinimumZoomMode.COVER_VIEWPORT -> settledMinZoom
+            MinimumZoomMode.FIT_WIDTH -> settledMinZoom - overshoot
+        }
+        return zoom.coerceIn(
+            minGestureZoom,
+            MAX_ZOOM + overshoot,
+        )
+    }
+
+    internal fun nearestSettledZoomLevel(zoom: Double): Double =
+        nearestZoomLevel(zoom, settledMinZoom, MAX_ZOOM)
+
     fun setCamera(
         camera: OsmCamera,
         reason: CameraChangeReason = CameraChangeReason.PROGRAMMATIC,
@@ -249,7 +307,7 @@ class OsmMapController private constructor(
         }
 
         val startCamera = this.camera
-        val endCamera = camera.normalized()
+        val endCamera = normalizeCameraForReason(camera, reason)
         if (startCamera == endCamera) {
             applyCamera(endCamera, reason, cancelAnimation = true)
             return
@@ -356,6 +414,28 @@ class OsmMapController private constructor(
         pendingFitBounds = null
         cameraAnimator?.cancel()
         cameraAnimator = null
+    }
+
+    fun snapZoom(durationMs: Long = 180L) {
+        snapZoom(durationMs, CameraChangeReason.PROGRAMMATIC)
+    }
+
+    internal fun snapZoom(
+        durationMs: Long,
+        reason: CameraChangeReason,
+    ) {
+        ensureNotDestroyed()
+        require(durationMs >= 0L) { "Zoom snap duration must be non-negative" }
+
+        val targetZoom = nearestSettledZoomLevel(camera.zoom)
+        if (kotlin.math.abs(targetZoom - camera.zoom) < 0.000_001) return
+
+        val targetCamera = camera.copy(zoom = targetZoom)
+        if (durationMs == 0L) {
+            applyCamera(targetCamera, reason, cancelAnimation = true)
+        } else {
+            animateCamera(targetCamera, durationMs, reason)
+        }
     }
 
     fun addTileLayer(
@@ -490,7 +570,9 @@ class OsmMapController private constructor(
         surfaceWidthPx = widthPx
         surfaceHeightPx = heightPx
         surfaceDensity = density
+        refreshViewportZoomLimits()
         pushResizeIfReady()
+        reconcileCameraWithSettledBounds(CameraChangeReason.RESTORE)
         applyPendingFitBoundsIfPossible()
     }
 
@@ -612,7 +694,7 @@ class OsmMapController private constructor(
             cameraAnimator = null
         }
         pendingFitBounds = null
-        val normalized = camera.normalized()
+        val normalized = normalizeCameraForReason(camera, reason)
         this.camera = normalized
         if (reason == CameraChangeReason.GESTURE) {
             scheduleCameraToNative(normalized)
@@ -644,7 +726,7 @@ class OsmMapController private constructor(
 
         val zoomX = zoomToFitSpan(spanX, usableWidthPx)
         val zoomY = zoomToFitSpan(spanY, usableHeightPx)
-        val targetZoom = minOf(zoomX, zoomY).coerceIn(MIN_ZOOM, MAX_ZOOM)
+        val targetZoom = minOf(zoomX, zoomY).coerceIn(settledMinZoom, MAX_ZOOM)
 
         return OsmCamera(
             centerLat = normalizedYToLatitude(centerY),
@@ -664,6 +746,94 @@ class OsmMapController private constructor(
             return MIN_ZOOM
         }
         return kotlin.math.log2(scale)
+    }
+
+    private fun normalizeCameraForReason(
+        camera: OsmCamera,
+        reason: CameraChangeReason,
+    ): OsmCamera {
+        val normalized = camera.normalized()
+        val zoom = when (reason) {
+            CameraChangeReason.GESTURE -> clampGestureZoom(normalized.zoom)
+            CameraChangeReason.PROGRAMMATIC,
+            CameraChangeReason.RESTORE -> clampSettledZoom(normalized.zoom)
+        }
+        return clampCameraCenterForViewport(normalized.copy(zoom = zoom))
+    }
+
+    private fun clampCameraCenterForViewport(camera: OsmCamera): OsmCamera {
+        if (surfaceHeightPx <= 0) {
+            return camera
+        }
+
+        val worldSize = worldSizePx(camera.zoom)
+        if (!worldSize.isFinite() || worldSize <= 0.0) {
+            return camera
+        }
+
+        val halfViewportHeight = surfaceHeightPx.toDouble() / 2.0
+        val centerY = latitudeToNormalizedY(camera.centerLat) * worldSize
+        val clampedCenterY = if (worldSize <= surfaceHeightPx.toDouble()) {
+            worldSize / 2.0
+        } else {
+            centerY.coerceIn(halfViewportHeight, worldSize - halfViewportHeight)
+        }
+
+        if (kotlin.math.abs(clampedCenterY - centerY) < 0.000_001) {
+            return camera
+        }
+
+        return camera.copy(centerLat = normalizedYToLatitude(clampedCenterY / worldSize))
+    }
+
+    private fun refreshViewportZoomLimits() {
+        settledMinZoom = computeViewportMinZoom()
+    }
+
+    private fun computeViewportMinZoom(): Double {
+        if (surfaceWidthPx <= 0 || surfaceHeightPx <= 0) {
+            return MIN_ZOOM
+        }
+
+        val viewportSizePx = when (zoomLimitConfig.minimumMode) {
+            MinimumZoomMode.COVER_VIEWPORT -> maxOf(surfaceWidthPx, surfaceHeightPx)
+            MinimumZoomMode.FIT_WIDTH -> surfaceWidthPx
+        }.toDouble()
+
+        val scale = viewportSizePx / TILE_SIZE_PX
+        if (!scale.isFinite() || scale <= 0.0) {
+            return MIN_ZOOM
+        }
+        return kotlin.math.log2(scale).coerceIn(MIN_ZOOM, MAX_ZOOM)
+    }
+
+    private fun reconcileCameraWithSettledBounds(reason: CameraChangeReason) {
+        val targetCamera = normalizeCameraForReason(
+            camera.copy(zoom = clampSettledZoom(camera.zoom)),
+            reason,
+        )
+        if (camerasAreClose(targetCamera, camera)) return
+
+        applyCamera(
+            targetCamera,
+            reason,
+            cancelAnimation = true,
+        )
+    }
+
+    private fun camerasAreClose(left: OsmCamera, right: OsmCamera): Boolean =
+        kotlin.math.abs(left.centerLat - right.centerLat) < 0.000_001 &&
+            kotlin.math.abs(left.centerLon - right.centerLon) < 0.000_001 &&
+            kotlin.math.abs(left.zoom - right.zoom) < 0.000_001 &&
+            kotlin.math.abs(left.bearing - right.bearing) < 0.000_001 &&
+            kotlin.math.abs(left.pitch - right.pitch) < 0.000_001
+
+    private fun validateZoomLimitConfig(config: ZoomLimitConfig) {
+        require(config.rubberBandZoom.isFinite()) { "Rubber-band zoom must be finite" }
+        require(config.rubberBandZoom >= 0.0) { "Rubber-band zoom must be non-negative" }
+        require(config.rubberBandZoom <= MAX_TRANSIENT_ZOOM_OVERSHOOT) {
+            "Rubber-band zoom must be at most $MAX_TRANSIENT_ZOOM_OVERSHOOT"
+        }
     }
 
     private fun boundsFromCoordinates(coordinates: Iterable<OsmCoordinate>): OsmBounds {
