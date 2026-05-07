@@ -233,17 +233,25 @@ class OsmMapController private constructor(
         camera: OsmCamera,
         durationMs: Long = 300L,
     ) {
+        animateCamera(camera, durationMs, CameraChangeReason.PROGRAMMATIC)
+    }
+
+    internal fun animateCamera(
+        camera: OsmCamera,
+        durationMs: Long,
+        reason: CameraChangeReason,
+    ) {
         ensureNotDestroyed()
 
         if (durationMs <= 0L) {
-            moveCamera(camera)
+            applyCamera(camera, reason, cancelAnimation = true)
             return
         }
 
         val startCamera = this.camera
         val endCamera = camera.normalized()
         if (startCamera == endCamera) {
-            applyCamera(endCamera, CameraChangeReason.PROGRAMMATIC, cancelAnimation = true)
+            applyCamera(endCamera, reason, cancelAnimation = true)
             return
         }
 
@@ -256,7 +264,7 @@ class OsmMapController private constructor(
                 val interpolated = interpolateCamera(startCamera, endCamera, fraction)
                 applyCamera(
                     interpolated,
-                    CameraChangeReason.PROGRAMMATIC,
+                    reason,
                     cancelAnimation = false,
                 )
             }

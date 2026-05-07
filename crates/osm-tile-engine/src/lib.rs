@@ -12,3 +12,9 @@ pub use mobile::{
 
 #[cfg(feature = "android-renderer")]
 pub mod android_renderer;
+
+#[cfg(any(feature = "android-renderer", test))]
+mod tile_request_queue;
+
+#[cfg(any(feature = "android-renderer", test))]
+mod tile_retention;

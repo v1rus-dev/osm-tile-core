@@ -162,6 +162,42 @@ pub fn visible_tiles(
     Ok(tiles)
 }
 
+pub fn position_tile(
+    camera: MapCamera,
+    viewport: RenderViewport,
+    tile_id: TileId,
+) -> Result<VisibleTile, RenderError> {
+    let camera = camera.validate()?;
+    let viewport = viewport.validate()?;
+    let tile_id = tile_id.validate()?;
+    let scale = 2_f64.powf(camera.zoom - tile_id.z as f64);
+    let center = GeoPoint::new(camera.center_lat, camera.center_lon)?;
+    let (center_x, center_y) =
+        MapProjection::WebMercator.project_to_world_pixels(center, tile_id.z)?;
+    let limit = 1_i64 << tile_id.z;
+    let center_tile_x = center_x / TILE_SIZE_PX;
+    let base_x = tile_id.x as i64;
+    let wrapped_x = [base_x - limit, base_x, base_x + limit]
+        .into_iter()
+        .min_by(|left, right| {
+            ((*left as f64) - center_tile_x)
+                .abs()
+                .total_cmp(&((*right as f64) - center_tile_x).abs())
+        })
+        .unwrap_or(base_x);
+    let tile_world_left_px = wrapped_x as f64 * TILE_SIZE_PX;
+    let tile_world_top_px = tile_id.y as f64 * TILE_SIZE_PX;
+    let half_width_screen_px = viewport.width_px as f64 / 2.0;
+    let half_height_screen_px = viewport.height_px as f64 / 2.0;
+
+    Ok(VisibleTile {
+        id: tile_id,
+        screen_x_px: ((tile_world_left_px - center_x) * scale + half_width_screen_px) as f32,
+        screen_y_px: ((tile_world_top_px - center_y) * scale + half_height_screen_px) as f32,
+        size_px: (TILE_SIZE_PX * scale) as f32,
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -201,6 +237,16 @@ mod tests {
 
         assert!(tiles.iter().all(|tile| tile.id.z == 3));
         assert!(!tiles.is_empty());
+    }
+
+    #[test]
+    fn position_tile_projects_any_zoom_level() {
+        let camera = MapCamera::new(0.0, 0.0, 3.5).unwrap();
+        let viewport = RenderViewport::new(256, 256, 1.0).unwrap();
+        let tile = position_tile(camera, viewport, TileId::new(2, 2, 2).unwrap()).unwrap();
+
+        assert_eq!(tile.id, TileId::new(2, 2, 2).unwrap());
+        assert!(tile.size_px > 256.0);
     }
 
     #[test]

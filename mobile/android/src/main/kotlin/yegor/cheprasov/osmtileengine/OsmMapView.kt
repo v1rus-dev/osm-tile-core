@@ -12,6 +12,7 @@ import android.view.Choreographer
 import android.view.ScaleGestureDetector
 import android.view.SurfaceHolder
 import android.view.SurfaceView
+import android.view.ViewConfiguration
 import android.widget.FrameLayout
 import android.widget.LinearLayout
 import android.widget.TextView
@@ -40,18 +41,32 @@ class OsmMapView @JvmOverloads constructor(
         val minVelocityThreshold: Float = 45f,
     )
 
+    data class DoubleTapZoomConfig(
+        val enabled: Boolean = true,
+        val zoomDelta: Double = 2.0,
+        val durationMs: Long = 180L,
+    )
+
     private var surfaceReady = false
     private var surfaceWidth = 0
     private var surfaceHeight = 0
     private var lastTouchX = 0f
     private var lastTouchY = 0f
+    private var downTouchX = 0f
+    private var downTouchY = 0f
     private var dragging = false
+    private var trackingTap = false
+    private var suppressGestureUntilUp = false
+    private var lastTapTimeMs = 0L
+    private var lastTapX = 0f
+    private var lastTapY = 0f
     private var flingConfig = FlingConfig()
     private var flingVelocityX = 0.0
     private var flingVelocityY = 0.0
     private var flingStartNs = 0L
     private var flingLastFrameNs = 0L
     private var flingRunning = false
+    private var doubleTapZoomConfig = DoubleTapZoomConfig()
 
     private var tileUrlTemplate: String = ""
     private var cacheDir: String = context.filesDir.resolve(DEFAULT_CACHE_DIR).absolutePath
@@ -68,6 +83,13 @@ class OsmMapView @JvmOverloads constructor(
     private val overlayContainer = LinearLayout(context)
     private val zoomOverlayView = buildOverlayTextView()
     private val centerCoordinatesOverlayView = buildOverlayTextView()
+    private val viewConfiguration = ViewConfiguration.get(context)
+    private val touchSlopSquared = viewConfiguration.scaledTouchSlop
+        .toFloat()
+        .let { it * it }
+    private val doubleTapSlopSquared = viewConfiguration.scaledDoubleTapSlop
+        .toFloat()
+        .let { it * it }
 
     private val scaleDetector = ScaleGestureDetector(
         context,
@@ -93,6 +115,7 @@ class OsmMapView @JvmOverloads constructor(
                 velocityY: Float,
             ): Boolean {
                 if (!flingConfig.enabled || flingConfig.mode != FlingMode.INERTIAL) return false
+                if (suppressGestureUntilUp || trackingTap) return false
                 startFling(velocityX, velocityY)
                 return true
             }
@@ -398,43 +421,133 @@ class OsmMapView @JvmOverloads constructor(
     }
 
     private fun handleTouchEvent(event: MotionEvent): Boolean {
-        gestureDetector.onTouchEvent(event)
-        scaleDetector.onTouchEvent(event)
+        if (event.actionMasked == MotionEvent.ACTION_DOWN) {
+            return handleActionDown(event)
+        }
+
+        if (!suppressGestureUntilUp) {
+            gestureDetector.onTouchEvent(event)
+            scaleDetector.onTouchEvent(event)
+        }
 
         when (event.actionMasked) {
-            MotionEvent.ACTION_DOWN -> {
-                stopFling()
-                dragging = true
-                lastTouchX = event.x
-                lastTouchY = event.y
-                this.parent?.requestDisallowInterceptTouchEvent(true)
-                return true
-            }
             MotionEvent.ACTION_POINTER_DOWN -> {
+                trackingTap = false
                 dragging = false
                 return true
             }
             MotionEvent.ACTION_MOVE -> {
-                if (!scaleDetector.isInProgress && dragging) {
-                    val dx = event.x - lastTouchX
-                    val dy = event.y - lastTouchY
-                    lastTouchX = event.x
-                    lastTouchY = event.y
-                    panBy(dx, dy)
-                }
+                handleActionMove(event)
                 return true
             }
-            MotionEvent.ACTION_UP, MotionEvent.ACTION_CANCEL -> {
-                dragging = false
+            MotionEvent.ACTION_UP -> {
+                handleActionUp(event)
                 if (flingConfig.mode == FlingMode.STOP_ON_RELEASE) {
                     stopFling()
                 }
                 this.parent?.requestDisallowInterceptTouchEvent(false)
                 return true
             }
+            MotionEvent.ACTION_CANCEL -> {
+                resetActiveTouch()
+                clearLastTap()
+                this.parent?.requestDisallowInterceptTouchEvent(false)
+                return true
+            }
         }
 
         return true
+    }
+
+    private fun handleActionDown(event: MotionEvent): Boolean {
+        stopFling()
+        downTouchX = event.x
+        downTouchY = event.y
+        lastTouchX = event.x
+        lastTouchY = event.y
+        dragging = false
+        trackingTap = true
+        suppressGestureUntilUp = false
+        this.parent?.requestDisallowInterceptTouchEvent(true)
+
+        if (isDoubleTap(event)) {
+            resetActiveTouch()
+            clearLastTap()
+            suppressGestureUntilUp = true
+            zoomInOnDoubleTap(event.x, event.y)
+            return true
+        }
+
+        gestureDetector.onTouchEvent(event)
+        scaleDetector.onTouchEvent(event)
+        return true
+    }
+
+    private fun handleActionMove(event: MotionEvent) {
+        if (suppressGestureUntilUp || scaleDetector.isInProgress || event.pointerCount > 1) {
+            trackingTap = false
+            dragging = false
+            return
+        }
+
+        if (!dragging) {
+            if (!trackingTap) {
+                return
+            }
+            val dxFromDown = event.x - downTouchX
+            val dyFromDown = event.y - downTouchY
+            if (distanceSquared(dxFromDown, dyFromDown) <= touchSlopSquared) {
+                return
+            }
+            dragging = true
+            trackingTap = false
+            lastTouchX = event.x
+            lastTouchY = event.y
+            return
+        }
+
+        val dx = event.x - lastTouchX
+        val dy = event.y - lastTouchY
+        lastTouchX = event.x
+        lastTouchY = event.y
+        panBy(dx, dy)
+    }
+
+    private fun handleActionUp(event: MotionEvent) {
+        if (suppressGestureUntilUp) {
+            resetActiveTouch()
+            return
+        }
+
+        if (trackingTap && !dragging && isWithinTouchSlop(event.x, event.y)) {
+            lastTapTimeMs = event.eventTime
+            lastTapX = downTouchX
+            lastTapY = downTouchY
+        }
+        resetActiveTouch()
+    }
+
+    private fun resetActiveTouch() {
+        dragging = false
+        trackingTap = false
+        suppressGestureUntilUp = false
+    }
+
+    private fun isDoubleTap(event: MotionEvent): Boolean {
+        if (!doubleTapZoomConfig.enabled || lastTapTimeMs == 0L) return false
+        val elapsedMs = event.eventTime - lastTapTimeMs
+        if (elapsedMs < 0L || elapsedMs > ViewConfiguration.getDoubleTapTimeout().toLong()) return false
+
+        return distanceSquared(event.x - lastTapX, event.y - lastTapY) <= doubleTapSlopSquared
+    }
+
+    private fun isWithinTouchSlop(x: Float, y: Float): Boolean =
+        distanceSquared(x - downTouchX, y - downTouchY) <= touchSlopSquared
+
+    private fun distanceSquared(dx: Float, dy: Float): Float = dx * dx + dy * dy
+
+    private fun clearLastTap() {
+        lastTapTimeMs = 0L
     }
 
     private fun panBy(dx: Float, dy: Float) {
@@ -464,6 +577,21 @@ class OsmMapView @JvmOverloads constructor(
     }
 
     fun getFlingConfig(): FlingConfig = flingConfig
+
+    fun setDoubleTapZoomConfig(config: DoubleTapZoomConfig) {
+        require(config.zoomDelta.isFinite()) { "Double-tap zoom delta must be finite" }
+        require(config.zoomDelta >= 0.0) { "Double-tap zoom delta must be non-negative" }
+        require(config.durationMs >= 0L) { "Double-tap zoom duration must be non-negative" }
+        doubleTapZoomConfig = config
+    }
+
+    fun getDoubleTapZoomConfig(): DoubleTapZoomConfig = doubleTapZoomConfig
+
+    fun setDoubleTapZoomDelta(zoomDelta: Double) {
+        setDoubleTapZoomConfig(doubleTapZoomConfig.copy(zoomDelta = zoomDelta))
+    }
+
+    fun getDoubleTapZoomDelta(): Double = doubleTapZoomConfig.zoomDelta
 
     private fun startFling(velocityX: Float, velocityY: Float) {
         val speedX = velocityX * flingConfig.velocityMultiplier
@@ -546,6 +674,33 @@ class OsmMapView @JvmOverloads constructor(
                 centerLon = normalizedXToLongitude(nextCenterNormX),
                 zoom = newZoom,
             ),
+            CameraChangeReason.GESTURE,
+        )
+    }
+
+    private fun zoomInOnDoubleTap(tapX: Float, tapY: Float) {
+        if (surfaceWidth <= 0 || surfaceHeight <= 0) return
+
+        val controller = ensureActiveController()
+        val camera = controller.getCamera()
+        val oldWorldSize = worldSizePx(camera.zoom)
+        val halfWidth = surfaceWidth / 2.0
+        val halfHeight = surfaceHeight / 2.0
+        val tapNormX =
+            (longitudeToNormalizedX(camera.centerLon) * oldWorldSize + (tapX - halfWidth)) /
+                oldWorldSize
+        val tapNormY =
+            ((latitudeToNormalizedY(camera.centerLat) * oldWorldSize + (tapY - halfHeight)) /
+                oldWorldSize).coerceIn(0.0, 1.0)
+        val targetZoom = (camera.zoom + doubleTapZoomConfig.zoomDelta).coerceIn(MIN_ZOOM, MAX_ZOOM)
+
+        controller.animateCamera(
+            camera.copy(
+                centerLat = normalizedYToLatitude(tapNormY),
+                centerLon = normalizedXToLongitude(tapNormX),
+                zoom = targetZoom,
+            ),
+            doubleTapZoomConfig.durationMs,
             CameraChangeReason.GESTURE,
         )
     }

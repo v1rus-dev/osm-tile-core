@@ -1,4 +1,3 @@
-use std::cmp::Ordering;
 use std::collections::{BinaryHeap, HashMap, HashSet, VecDeque};
 use std::ffi::{CString, c_char, c_int, c_void};
 use std::path::PathBuf;
@@ -11,13 +10,21 @@ use std::time::{Duration, Instant};
 
 #[cfg(feature = "mobile")]
 use crate::mobile::OsmTileEngine;
+use crate::tile_request_queue::{
+    PrioritizedTileRequest, TileLoadRequest, TileRequestMetadata, pending_metadata_matches,
+    prune_queued_requests, queue_tile_request, same_tile_request,
+};
+use crate::tile_retention::should_evict_for_zoom;
 use image::GenericImageView;
 use jni::JNIEnv;
 use jni::objects::{JClass, JObject, JString};
 use jni::sys::{jboolean, jdouble, jfloat, jint, jlong};
 use osm_core::TileId;
 use osm_loader::{CachedTileSource, FileTileCache, HttpTileSource, TileSource};
-use osm_renderer::{LayerId, MapCamera, MapLayer, RenderState, RenderViewport, TileLayer};
+use osm_renderer::{
+    LayerId, MapCamera, MapLayer, RenderState, RenderViewport, TileLayer, TileLoadPlan,
+    TilePlanOptions, TilePlanPriority, plan_tile_loads, position_tile,
+};
 
 const DEFAULT_TILE_LAYER_ID: &str = "base";
 const LOG_TAG: &str = "OsmTileEngine";
@@ -71,6 +78,8 @@ const CAMERA_IDLE_PREFETCH_DELAY: Duration = Duration::from_millis(250);
 const TELEMETRY_LOG_INTERVAL: Duration = Duration::from_secs(1);
 const MOVING_UPLOADS_PER_FRAME: usize = 1;
 const IDLE_UPLOADS_PER_FRAME: usize = 2;
+const URGENT_UPLOADS_PER_FRAME: usize = 4;
+const RECENT_TILE_HISTORY_LIMIT: usize = 128;
 
 #[derive(Debug, Clone, Copy)]
 struct TileCacheLimits {
@@ -220,7 +229,10 @@ impl<T> SizedLruCache<T> {
         value
     }
 
-    fn peek(&self, key: &TileId) -> Option<&T> {
+    fn get_ref_touch(&mut self, key: &TileId) -> Option<&T> {
+        if self.entries.contains_key(key) {
+            self.touch(*key);
+        }
         self.entries.get(key).map(|(value, _)| value)
     }
 
@@ -461,6 +473,7 @@ enum RenderCommand {
     },
     TileLoaded {
         id: TileId,
+        metadata: TileRequestMetadata,
         tile: Option<LoadedTile>,
         error: Option<String>,
         fetch_elapsed: Duration,
@@ -471,6 +484,10 @@ enum RenderCommand {
 
 enum TileLoaderRequest {
     Load(TileLoadRequest),
+    RetainPlan {
+        generation: u64,
+        tile_ids: HashSet<TileId>,
+    },
     Shutdown,
 }
 
@@ -484,22 +501,11 @@ struct FetchedTile {
 #[derive(Debug)]
 struct DecodedTileResult {
     id: TileId,
+    metadata: TileRequestMetadata,
     tile: Option<LoadedTile>,
     error: Option<String>,
     fetch_elapsed: Duration,
     decode_elapsed: Duration,
-}
-
-#[derive(Debug, Clone, Copy)]
-struct TileRequestMetadata {
-    generation: u64,
-}
-
-#[derive(Debug, Clone, Copy)]
-struct TileLoadRequest {
-    id: TileId,
-    metadata: TileRequestMetadata,
-    priority: f32,
 }
 
 #[derive(Debug, Clone)]
@@ -580,19 +586,31 @@ struct UploadedTile {
     bind_group: wgpu::BindGroup,
 }
 
-struct TileDrawRef<'a> {
-    bind_group: &'a wgpu::BindGroup,
+struct TileDraw {
+    bind_group: wgpu::BindGroup,
     uv_left: f32,
     uv_right: f32,
     uv_top: f32,
     uv_bottom: f32,
 }
 
-#[derive(Debug, Default, Clone, Copy)]
+#[derive(Debug, Clone, Copy)]
+struct TileQuad {
+    screen_x_px: f32,
+    screen_y_px: f32,
+    size_px: f32,
+    uv_left: f32,
+    uv_right: f32,
+    uv_top: f32,
+    uv_bottom: f32,
+}
+
+#[derive(Debug, Default, Clone)]
 struct RenderStats {
     visible_tiles: usize,
     drawn_tiles: usize,
     missing_tiles: usize,
+    drawn_visible_tile_ids: Vec<TileId>,
 }
 
 struct RendererWorker {
@@ -605,7 +623,7 @@ struct RendererWorker {
     request_generation: u64,
     last_camera_center: Option<(f64, f64)>,
     camera_velocity_hint: (f32, f32),
-    pending_tile_priorities: HashMap<TileId, TilePriority>,
+    pending_tile_priorities: HashMap<TileId, TilePlanPriority>,
     tile_requests: Sender<TileLoaderRequest>,
     gpu: Option<GpuSurface>,
     camera_motion: CameraMotion,
@@ -613,16 +631,11 @@ struct RendererWorker {
     telemetry: TileTelemetry,
     cache_limits: TileCacheLimits,
     last_visible_zoom: Option<u32>,
+    protected_tile_ids: HashSet<TileId>,
+    last_stable_tile_ids: Vec<TileId>,
     pending_camera: Option<MapCamera>,
     needs_render: bool,
     render_in_flight: bool,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
-enum TilePriority {
-    P0Visible = 0,
-    P1LookAhead = 1,
-    P2Periphery = 2,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -681,6 +694,8 @@ impl RendererWorker {
             telemetry: TileTelemetry::default(),
             cache_limits: TileCacheLimits::default(),
             last_visible_zoom: None,
+            protected_tile_ids: HashSet::new(),
+            last_stable_tile_ids: Vec::new(),
             pending_camera: None,
             needs_render: false,
             render_in_flight: false,
@@ -799,17 +814,23 @@ impl RendererWorker {
                     }
                     RenderCommand::TileLoaded {
                         id,
+                        metadata,
                         tile,
                         error,
                         fetch_elapsed,
                         decode_elapsed,
                     } => {
-                        let still_relevant = self.pending_metadata.contains_key(&id);
-                        self.pending_tile_loads.remove(&id);
+                        let matches_pending =
+                            pending_metadata_matches(&self.pending_metadata, id, metadata);
+                        let still_relevant = matches_pending || self.should_keep_late_tile(id);
+                        if matches_pending {
+                            self.pending_metadata.remove(&id);
+                            self.pending_tile_loads.remove(&id);
+                            self.pending_tile_priorities.remove(&id);
+                        }
                         if still_relevant {
                             self.telemetry.record_fetch(fetch_elapsed);
                             self.telemetry.record_decode(decode_elapsed);
-                            self.pending_metadata.remove(&id);
                             if let Some(error) = error {
                                 log_warn(format!(
                                     "tile z={} x={} y={} failed: {}",
@@ -928,10 +949,15 @@ impl RendererWorker {
             None
         };
 
+        let stale_tiles = self.stale_tiles_for_current_camera();
         if let Some(visible_tiles) = visible_tiles.as_ref() {
+            let request_plan = self.build_tile_request_plan(visible_tiles);
+            self.protected_tile_ids = request_plan.tiles().iter().map(|tile| tile.id).collect();
             self.evict_far_zoom_layers(visible_tiles);
-            self.ensure_visible_tiles(visible_tiles);
+            self.ensure_planned_tiles(visible_tiles, &request_plan);
             self.enforce_cache_limits(visible_tiles);
+        } else {
+            self.protected_tile_ids.clear();
         }
 
         let mut stats = visible_tiles
@@ -941,39 +967,68 @@ impl RendererWorker {
                 ..Default::default()
             })
             .unwrap_or_default();
-        if let Some(gpu) = self.gpu.as_mut() {
-            if let Some(render_stats) = gpu.render(visible_tiles.as_deref()) {
-                stats = render_stats;
-            }
+        if let Some(gpu) = self.gpu.as_mut()
+            && let Some(render_stats) = gpu.render(visible_tiles.as_deref(), &stale_tiles)
+        {
+            stats = render_stats;
         }
+        self.remember_drawn_tiles(&stats.drawn_visible_tile_ids);
         self.telemetry
             .record_render(render_started.elapsed(), stats);
         self.log_telemetry_if_due();
     }
 
-    fn ensure_visible_tiles(&mut self, visible_tiles: &[osm_renderer::VisibleTile]) {
-        let request_plan = self.build_tile_request_plan(visible_tiles);
+    fn ensure_planned_tiles(
+        &mut self,
+        visible_tiles: &[osm_renderer::VisibleTile],
+        request_plan: &TileLoadPlan,
+    ) {
         self.pending_tile_loads
-            .retain(|tile_id| request_plan.contains_key(tile_id));
+            .retain(|tile_id| request_plan.contains(*tile_id));
         self.pending_metadata
-            .retain(|tile_id, _| request_plan.contains_key(tile_id));
+            .retain(|tile_id, _| request_plan.contains(*tile_id));
         self.pending_tile_priorities
-            .retain(|tile_id, _| request_plan.contains_key(tile_id));
+            .retain(|tile_id, _| request_plan.contains(*tile_id));
+
+        let plan_tile_ids = request_plan
+            .tiles()
+            .iter()
+            .map(|planned| planned.id)
+            .collect::<HashSet<_>>();
+        if self
+            .tile_requests
+            .send(TileLoaderRequest::RetainPlan {
+                generation: self.request_generation,
+                tile_ids: plan_tile_ids,
+            })
+            .is_err()
+        {
+            log_warn("failed to prune tile loader queue: tile loader is gone");
+        }
 
         let mut ordered_requests = request_plan
+            .tiles()
             .iter()
-            .filter(|(tile_id, _)| {
-                !self.loaded_tiles.contains_key(tile_id)
-                    && !self.pending_tile_loads.contains(tile_id)
+            .filter(|planned| {
+                let tile_id = planned.id;
+                !self.loaded_tiles.contains_key(&tile_id)
+                    && (!self.pending_tile_loads.contains(&tile_id)
+                        || self.should_refresh_pending_tile(tile_id, planned.priority))
             })
-            .map(|(tile_id, priority)| (*tile_id, *priority))
+            .map(|planned| (planned.id, planned.priority))
             .collect::<Vec<_>>();
         ordered_requests.sort_by_key(|(_, priority)| *priority);
 
         let max_inflight = self.prefetch_budget();
         let available_slots = max_inflight.saturating_sub(self.pending_tile_loads.len());
         let mut enqueued = 0_usize;
-        for (tile_id, priority) in ordered_requests.into_iter().take(available_slots) {
+        let mut new_requests = 0_usize;
+        for (tile_id, priority) in ordered_requests {
+            let already_pending = self.pending_tile_loads.contains(&tile_id);
+            if !already_pending && new_requests >= available_slots {
+                continue;
+            }
+
             let metadata = TileRequestMetadata {
                 generation: self.request_generation,
             };
@@ -993,14 +1048,17 @@ impl RendererWorker {
                     tile_id.z, tile_id.x, tile_id.y
                 )),
             }
+            if !already_pending {
+                new_requests += 1;
+            }
         }
         self.telemetry.tile_requests_enqueued += enqueued as u64;
 
         let upload_budget = self.upload_budget_per_frame();
         let mut uploads_this_frame = 0_usize;
         let mut deferred_uploads = 0_usize;
-        for visible_tile in visible_tiles {
-            let tile_id = visible_tile.id;
+        for planned in request_plan.tiles() {
+            let tile_id = planned.id;
             let loaded = self.loaded_tiles.contains_key(&tile_id);
             if loaded {
                 self.telemetry.decoded_hit += 1;
@@ -1020,7 +1078,12 @@ impl RendererWorker {
             }
 
             self.telemetry.gpu_miss += 1;
-            if uploads_this_frame >= upload_budget {
+            let max_uploads = if planned.priority <= TilePlanPriority::Fallback {
+                upload_budget.max(URGENT_UPLOADS_PER_FRAME)
+            } else {
+                upload_budget
+            };
+            if uploads_this_frame >= max_uploads {
                 deferred_uploads += 1;
                 continue;
             }
@@ -1028,11 +1091,11 @@ impl RendererWorker {
             let Some(tile_data) = self.loaded_tiles.get_cloned(&tile_id) else {
                 continue;
             };
-            if let Some(gpu) = self.gpu.as_mut() {
-                if !gpu.uploaded_tiles.contains_key(&tile_id) {
-                    gpu.upload_tile(tile_id, &tile_data, &mut self.telemetry);
-                    uploads_this_frame += 1;
-                }
+            if let Some(gpu) = self.gpu.as_mut()
+                && !gpu.uploaded_tiles.contains_key(&tile_id)
+            {
+                gpu.upload_tile(tile_id, &tile_data, &mut self.telemetry);
+                uploads_this_frame += 1;
             }
         }
 
@@ -1053,15 +1116,15 @@ impl RendererWorker {
                 let zoom = camera.tile_zoom();
                 let prev = osm_core::GeoPoint::new(last_camera.center_lat, last_camera.center_lon);
                 let curr = osm_core::GeoPoint::new(camera.center_lat, camera.center_lon);
-                if let (Ok(prev), Ok(curr)) = (prev, curr) {
-                    if let (Ok((px, py)), Ok((cx, cy))) = (
+                if let (Ok(prev), Ok(curr)) = (prev, curr)
+                    && let (Ok((px, py)), Ok((cx, cy))) = (
                         osm_core::MapProjection::WebMercator.project_to_world_pixels(prev, zoom),
                         osm_core::MapProjection::WebMercator.project_to_world_pixels(curr, zoom),
-                    ) {
-                        let dx_tiles = (cx - px) / osm_core::TILE_SIZE_PX;
-                        let dy_tiles = (cy - py) / osm_core::TILE_SIZE_PX;
-                        self.camera_motion.velocity_tiles_per_sec = (dx_tiles / dt, dy_tiles / dt);
-                    }
+                    )
+                {
+                    let dx_tiles = (cx - px) / osm_core::TILE_SIZE_PX;
+                    let dy_tiles = (cy - py) / osm_core::TILE_SIZE_PX;
+                    self.camera_motion.velocity_tiles_per_sec = (dx_tiles / dt, dy_tiles / dt);
                 }
             }
         }
@@ -1069,137 +1132,49 @@ impl RendererWorker {
         self.camera_motion.last_update = Some(now);
     }
 
-    fn build_tile_request_plan(
-        &self,
-        visible_tiles: &[osm_renderer::VisibleTile],
-    ) -> HashMap<TileId, TilePriority> {
-        let mut plan = HashMap::new();
-        if visible_tiles.is_empty() {
-            return plan;
-        }
-        let zoom = visible_tiles[0].id.z;
-        let limit = 1_i64 << zoom;
-        let min_x = visible_tiles
-            .iter()
-            .map(|t| t.id.x as i64)
-            .min()
-            .unwrap_or(0);
-        let max_x = visible_tiles
-            .iter()
-            .map(|t| t.id.x as i64)
-            .max()
-            .unwrap_or(0);
-        let min_y = visible_tiles
-            .iter()
-            .map(|t| t.id.y as i64)
-            .min()
-            .unwrap_or(0);
-        let max_y = visible_tiles
-            .iter()
-            .map(|t| t.id.y as i64)
-            .max()
-            .unwrap_or(0);
-        for tile in visible_tiles {
-            plan.insert(tile.id, TilePriority::P0Visible);
-        }
-        if self.camera_is_moving() {
-            return plan;
-        }
-        let rings = self.dynamic_prefetch_rings();
-        for ring in 1..=rings {
-            for y in (min_y - ring as i64)..=(max_y + ring as i64) {
-                if y < 0 || y >= limit {
-                    continue;
-                }
-                for x in (min_x - ring as i64)..=(max_x + ring as i64) {
-                    let border = x == min_x - ring as i64
-                        || x == max_x + ring as i64
-                        || y == min_y - ring as i64
-                        || y == max_y + ring as i64;
-                    if !border {
-                        continue;
-                    }
-                    let wrapped_x = x.rem_euclid(limit);
-                    if let Ok(id) = TileId::new(zoom, wrapped_x as u32, y as u32) {
-                        plan.entry(id).or_insert(TilePriority::P2Periphery);
-                    }
-                }
-            }
-        }
-        for id in self.look_ahead_tiles(zoom, min_x, max_x, min_y, max_y) {
-            if !matches!(plan.get(&id), Some(TilePriority::P0Visible)) {
-                plan.insert(id, TilePriority::P1LookAhead);
-            }
-        }
-        plan
+    fn build_tile_request_plan(&self, visible_tiles: &[osm_renderer::VisibleTile]) -> TileLoadPlan {
+        plan_tile_loads(
+            visible_tiles,
+            TilePlanOptions {
+                moving: self.camera_is_moving(),
+                velocity_tiles_per_sec: self.camera_motion.velocity_tiles_per_sec,
+                zoom_fraction: self.state.camera().zoom.fract(),
+                ..TilePlanOptions::default()
+            },
+        )
     }
 
-    fn dynamic_prefetch_rings(&self) -> u32 {
-        let speed = self
-            .camera_motion
-            .velocity_tiles_per_sec
-            .0
-            .hypot(self.camera_motion.velocity_tiles_per_sec.1);
-        if speed > 3.5 {
-            3
-        } else if speed > 1.5 {
-            2
-        } else {
-            1
+    fn should_refresh_pending_tile(&self, tile_id: TileId, priority: TilePlanPriority) -> bool {
+        if priority > TilePlanPriority::LookAhead {
+            return false;
         }
-    }
+        let priority_improved = self
+            .pending_tile_priorities
+            .get(&tile_id)
+            .map(|pending| priority < *pending)
+            .unwrap_or(true);
+        let generation_stale = self
+            .pending_metadata
+            .get(&tile_id)
+            .map(|metadata| metadata.generation < self.request_generation)
+            .unwrap_or(true);
 
-    fn look_ahead_tiles(
-        &self,
-        zoom: u32,
-        min_x: i64,
-        max_x: i64,
-        min_y: i64,
-        max_y: i64,
-    ) -> Vec<TileId> {
-        let limit = 1_i64 << zoom;
-        let (vx, vy) = self.camera_motion.velocity_tiles_per_sec;
-        let speed = vx.hypot(vy);
-        if speed < 0.25 {
-            return Vec::new();
-        }
-        let dir_x = vx / speed;
-        let dir_y = vy / speed;
-        let depth = (speed.ceil() as i64).clamp(1, 3);
-        let half_width = 1_i64;
-        let mut tiles = Vec::new();
-        for step in 1..=depth {
-            for lateral in -half_width..=half_width {
-                let ahead_x = ((min_x + max_x) / 2)
-                    + (dir_x * step as f64).round() as i64
-                    + (dir_y * lateral as f64).round() as i64;
-                let ahead_y = ((min_y + max_y) / 2) + (dir_y * step as f64).round() as i64
-                    - (dir_x * lateral as f64).round() as i64;
-                if ahead_y < 0 || ahead_y >= limit {
-                    continue;
-                }
-                let wrapped_x = ahead_x.rem_euclid(limit);
-                if let Ok(id) = TileId::new(zoom, wrapped_x as u32, ahead_y as u32) {
-                    tiles.push(id);
-                }
-            }
-        }
-        tiles
+        priority_improved || generation_stale
     }
 
     fn prefetch_budget(&self) -> usize {
         if self.camera_is_moving() {
-            return 4;
+            return 12;
         }
 
         let render_ms = self.telemetry.avg_render_ms();
         let decode_ms = self.telemetry.avg_decode_ms();
         if render_ms > 24.0 || decode_ms > 14.0 {
-            4
-        } else if render_ms > 16.0 || decode_ms > 8.0 {
             8
-        } else {
+        } else if render_ms > 16.0 || decode_ms > 8.0 {
             12
+        } else {
+            20
         }
     }
 
@@ -1222,10 +1197,10 @@ impl RendererWorker {
 
     fn log_telemetry_if_due(&mut self) {
         let now = Instant::now();
-        if let Some(last_log) = self.telemetry.last_log {
-            if now.saturating_duration_since(last_log) < TELEMETRY_LOG_INTERVAL {
-                return;
-            }
+        if let Some(last_log) = self.telemetry.last_log
+            && now.saturating_duration_since(last_log) < TELEMETRY_LOG_INTERVAL
+        {
+            return;
         }
         self.telemetry.last_log = Some(now);
 
@@ -1251,13 +1226,15 @@ impl RendererWorker {
     fn tile_request_priority(
         &self,
         tile_id: TileId,
-        priority: TilePriority,
+        priority: TilePlanPriority,
         visible_tiles: &[osm_renderer::VisibleTile],
     ) -> f32 {
         let tier = match priority {
-            TilePriority::P0Visible => 3_000.0,
-            TilePriority::P1LookAhead => 2_000.0,
-            TilePriority::P2Periphery => 1_000.0,
+            TilePlanPriority::Visible => 5_000.0,
+            TilePlanPriority::Fallback => 4_000.0,
+            TilePlanPriority::LookAhead => 3_000.0,
+            TilePlanPriority::Periphery => 2_000.0,
+            TilePlanPriority::Child => 1_000.0,
         };
         let screen_priority = visible_tiles
             .iter()
@@ -1305,7 +1282,8 @@ impl RendererWorker {
     }
 
     fn enforce_cache_limits(&mut self, visible_tiles: &[osm_renderer::VisibleTile]) {
-        let visible_ids: HashSet<TileId> = visible_tiles.iter().map(|tile| tile.id).collect();
+        let mut visible_ids: HashSet<TileId> = visible_tiles.iter().map(|tile| tile.id).collect();
+        visible_ids.extend(self.protected_tile_ids.iter().copied());
         while self.loaded_tiles.current_size_bytes > self.loaded_tiles.size_limit_bytes {
             if self.loaded_tiles.evict_one(&visible_ids).is_none() {
                 break;
@@ -1340,7 +1318,14 @@ impl RendererWorker {
             .entries
             .keys()
             .copied()
-            .filter(|tile_id| tile_id.z.abs_diff(current_zoom) > max_distance)
+            .filter(|tile_id| {
+                should_evict_for_zoom(
+                    *tile_id,
+                    current_zoom,
+                    max_distance,
+                    &self.protected_tile_ids,
+                )
+            })
             .collect();
         for tile_id in stale_loaded {
             if self.loaded_tiles.remove(&tile_id).is_some() {
@@ -1353,7 +1338,14 @@ impl RendererWorker {
                 .entries
                 .keys()
                 .copied()
-                .filter(|tile_id| tile_id.z.abs_diff(current_zoom) > max_distance)
+                .filter(|tile_id| {
+                    should_evict_for_zoom(
+                        *tile_id,
+                        current_zoom,
+                        max_distance,
+                        &self.protected_tile_ids,
+                    )
+                })
                 .collect();
             for tile_id in stale_gpu {
                 if gpu.uploaded_tiles.remove(&tile_id).is_some() {
@@ -1361,6 +1353,70 @@ impl RendererWorker {
                 }
             }
         }
+    }
+
+    fn stale_tiles_for_current_camera(&self) -> Vec<osm_renderer::VisibleTile> {
+        let Some(viewport) = self.state.viewport() else {
+            return Vec::new();
+        };
+        let camera = self.state.camera();
+        self.last_stable_tile_ids
+            .iter()
+            .filter_map(|tile_id| position_tile(camera, viewport, *tile_id).ok())
+            .filter(|tile| tile_intersects_viewport(tile, viewport))
+            .collect()
+    }
+
+    fn remember_drawn_tiles(&mut self, drawn_tile_ids: &[TileId]) {
+        if drawn_tile_ids.is_empty() {
+            return;
+        }
+
+        let mut seen = HashSet::new();
+        let mut next = Vec::with_capacity(
+            drawn_tile_ids
+                .len()
+                .saturating_add(self.last_stable_tile_ids.len())
+                .min(RECENT_TILE_HISTORY_LIMIT),
+        );
+
+        for tile_id in drawn_tile_ids
+            .iter()
+            .copied()
+            .chain(self.last_stable_tile_ids.iter().copied())
+        {
+            if seen.insert(tile_id) {
+                next.push(tile_id);
+            }
+            if next.len() >= RECENT_TILE_HISTORY_LIMIT {
+                break;
+            }
+        }
+
+        self.last_stable_tile_ids = next;
+    }
+
+    fn should_keep_late_tile(&self, tile_id: TileId) -> bool {
+        if self.protected_tile_ids.contains(&tile_id)
+            || self.last_stable_tile_ids.contains(&tile_id)
+        {
+            return true;
+        }
+
+        let Some(viewport) = self.state.viewport() else {
+            return false;
+        };
+        let camera = self.state.camera();
+        let current_zoom = camera.tile_zoom();
+        if tile_id.z.abs_diff(current_zoom)
+            > u32::from(self.cache_limits.max_zoom_distance_to_keep).saturating_add(1)
+        {
+            return false;
+        }
+
+        position_tile(camera, viewport, tile_id)
+            .map(|tile| tile_intersects_viewport(&tile, viewport))
+            .unwrap_or(false)
     }
 }
 
@@ -1410,6 +1466,7 @@ fn tile_loader_loop(
                 };
                 let _ = tx.send(DecodedTileResult {
                     id: fetched.request.id,
+                    metadata: fetched.request.metadata,
                     tile,
                     error,
                     fetch_elapsed: fetched.fetch_elapsed,
@@ -1420,7 +1477,8 @@ fn tile_loader_loop(
     }
 
     let mut queued: BinaryHeap<PrioritizedTileRequest> = BinaryHeap::new();
-    let mut in_flight = HashSet::new();
+    let mut queued_best = HashMap::<TileId, TileLoadRequest>::new();
+    let mut active_fetches = HashSet::new();
     let mut in_flight_fetches = tokio::task::JoinSet::new();
     let mut shutting_down = false;
 
@@ -1428,13 +1486,19 @@ fn tile_loader_loop(
         while in_flight_fetches.len() < MAX_CONCURRENT_FETCHES {
             let Some(request) = queued.pop() else { break };
             let request = request.0;
-            if request.metadata.generation
-                != newest_generation(&queued, request.metadata.generation)
+            if queued_best
+                .get(&request.id)
+                .map(|best| !same_tile_request(*best, request))
+                .unwrap_or(true)
             {
-                in_flight.remove(&request.id);
+                continue;
+            }
+            queued_best.remove(&request.id);
+            if active_fetches.contains(&request.id) {
                 continue;
             }
             let source = source.clone();
+            active_fetches.insert(request.id);
             in_flight_fetches.spawn_on(
                 async move {
                     let fetch_started = Instant::now();
@@ -1469,9 +1533,18 @@ fn tile_loader_loop(
         while let Ok(request) = receiver.recv_timeout(Duration::from_millis(2)) {
             match request {
                 TileLoaderRequest::Load(request) => {
-                    if in_flight.insert(request.id) {
-                        queued.push(PrioritizedTileRequest(request));
-                    }
+                    queue_tile_request(&mut queued, &mut queued_best, request);
+                }
+                TileLoaderRequest::RetainPlan {
+                    generation,
+                    tile_ids,
+                } => {
+                    prune_queued_requests(&mut queued_best, &tile_ids);
+                    log_debug(format!(
+                        "tile loader pruned queued requests generation={} retained={}",
+                        generation,
+                        tile_ids.len()
+                    ));
                 }
                 TileLoaderRequest::Shutdown => {
                     log_info("tile loader shutdown requested");
@@ -1496,7 +1569,7 @@ fn tile_loader_loop(
         loop {
             match decoded_rx.try_recv() {
                 Ok(result) => {
-                    in_flight.remove(&result.id);
+                    active_fetches.remove(&result.id);
                     if result.tile.is_none() {
                         let cache = source.cache().clone();
                         if let Err(error) = runtime.block_on(cache.remove(result.id)) {
@@ -1509,6 +1582,7 @@ fn tile_loader_loop(
                     if commands
                         .send(RenderCommand::TileLoaded {
                             id: result.id,
+                            metadata: result.metadata,
                             tile: result.tile,
                             error: result.error,
                             fetch_elapsed: result.fetch_elapsed,
@@ -1527,7 +1601,7 @@ fn tile_loader_loop(
         if shutting_down
             && queued.is_empty()
             && in_flight_fetches.is_empty()
-            && in_flight.is_empty()
+            && active_fetches.is_empty()
         {
             break;
         }
@@ -1538,41 +1612,6 @@ fn tile_loader_loop(
         let _ = handle.join();
     }
     log_info("tile loader thread stopped");
-}
-
-#[derive(Debug, Clone, Copy)]
-struct PrioritizedTileRequest(TileLoadRequest);
-
-impl PartialEq for PrioritizedTileRequest {
-    fn eq(&self, other: &Self) -> bool {
-        self.0.id == other.0.id
-    }
-}
-
-impl Eq for PrioritizedTileRequest {}
-
-impl PartialOrd for PrioritizedTileRequest {
-    fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
-        Some(self.cmp(other))
-    }
-}
-
-impl Ord for PrioritizedTileRequest {
-    fn cmp(&self, other: &Self) -> Ordering {
-        self.0
-            .priority
-            .total_cmp(&other.0.priority)
-            .then_with(|| self.0.metadata.generation.cmp(&other.0.metadata.generation))
-    }
-}
-
-fn newest_generation(queue: &BinaryHeap<PrioritizedTileRequest>, fallback: u64) -> u64 {
-    queue
-        .iter()
-        .map(|entry| entry.0.metadata.generation)
-        .max()
-        .map(|generation| generation.max(fallback))
-        .unwrap_or(fallback)
 }
 
 impl GpuSurface {
@@ -1598,11 +1637,12 @@ impl GpuSurface {
                 compatible_surface: Some(&surface),
             }))
             .map_err(|error| error.to_string())?;
+        let required_limits = wgpu::Limits::downlevel_defaults().using_resolution(adapter.limits());
         let (device, queue) = runtime
             .block_on(adapter.request_device(&wgpu::DeviceDescriptor {
                 label: Some("osm-map-renderer-device"),
                 required_features: wgpu::Features::empty(),
-                required_limits: wgpu::Limits::default(),
+                required_limits,
                 experimental_features: wgpu::ExperimentalFeatures::disabled(),
                 memory_hints: wgpu::MemoryHints::Performance,
                 trace: wgpu::Trace::Off,
@@ -1783,10 +1823,9 @@ impl GpuSurface {
     fn render(
         &mut self,
         visible_tiles: Option<&[osm_renderer::VisibleTile]>,
+        stale_tiles: &[osm_renderer::VisibleTile],
     ) -> Option<RenderStats> {
-        if self.config.is_none() {
-            return None;
-        }
+        self.config.as_ref()?;
 
         let frame = match self.surface.get_current_texture() {
             wgpu::CurrentSurfaceTexture::Success(frame)
@@ -1839,71 +1878,127 @@ impl GpuSurface {
                 ..Default::default()
             })
             .unwrap_or_default();
-        if let Some(visible_tiles) = visible_tiles {
-            let mut batch_vertices = Vec::new();
-            let mut batch_draws = Vec::new();
-            let mut missing_tiles = 0_usize;
-            self.ensure_tile_vertex_buffer_capacity(
-                (visible_tiles.len() * 6 * std::mem::size_of::<TexturedVertex>()) as u64,
+        let mut batch_vertices = Vec::new();
+        let mut batch_draws = Vec::new();
+        let required_tile_count =
+            visible_tiles.map(|tiles| tiles.len() * 4).unwrap_or(0) + stale_tiles.len();
+        self.ensure_tile_vertex_buffer_capacity(
+            (required_tile_count * 6 * std::mem::size_of::<TexturedVertex>()) as u64,
+        );
+
+        for stale_tile in stale_tiles {
+            let Some(tile_draw) = self.resolve_tile_draw(stale_tile.id) else {
+                continue;
+            };
+            let vertex_start =
+                batch_vertices.len() as u64 * std::mem::size_of::<TexturedVertex>() as u64;
+            let vertices = tile_vertices(
+                TileQuad {
+                    screen_x_px: stale_tile.screen_x_px,
+                    screen_y_px: stale_tile.screen_y_px,
+                    size_px: stale_tile.size_px,
+                    uv_left: tile_draw.uv_left,
+                    uv_right: tile_draw.uv_right,
+                    uv_top: tile_draw.uv_top,
+                    uv_bottom: tile_draw.uv_bottom,
+                },
+                self.config
+                    .as_ref()
+                    .expect("surface configuration should exist"),
             );
+            batch_vertices.extend_from_slice(&vertices);
+            batch_draws.push((vertex_start, tile_draw.bind_group));
+        }
+
+        if let Some(visible_tiles) = visible_tiles {
+            let mut missing_tiles = 0_usize;
 
             for visible_tile in visible_tiles {
-                let Some(tile_draw) = self.resolve_tile_draw(visible_tile.id) else {
+                if let Some(tile_draw) = self.resolve_tile_draw(visible_tile.id) {
+                    let vertex_start =
+                        batch_vertices.len() as u64 * std::mem::size_of::<TexturedVertex>() as u64;
+                    let vertices = tile_vertices(
+                        TileQuad {
+                            screen_x_px: visible_tile.screen_x_px,
+                            screen_y_px: visible_tile.screen_y_px,
+                            size_px: visible_tile.size_px,
+                            uv_left: tile_draw.uv_left,
+                            uv_right: tile_draw.uv_right,
+                            uv_top: tile_draw.uv_top,
+                            uv_bottom: tile_draw.uv_bottom,
+                        },
+                        self.config
+                            .as_ref()
+                            .expect("surface configuration should exist"),
+                    );
+                    batch_vertices.extend_from_slice(&vertices);
+                    batch_draws.push((vertex_start, tile_draw.bind_group));
+                    stats.drawn_visible_tile_ids.push(visible_tile.id);
+                    continue;
+                }
+
+                let child_draws = self.resolve_child_tile_draws(visible_tile.id);
+                if child_draws.is_empty() {
                     missing_tiles += 1;
                     continue;
-                };
-                let vertex_start =
-                    batch_vertices.len() as u64 * std::mem::size_of::<TexturedVertex>() as u64;
-                let vertices = tile_vertices(
-                    visible_tile.screen_x_px,
-                    visible_tile.screen_y_px,
-                    visible_tile.size_px,
-                    tile_draw.uv_left,
-                    tile_draw.uv_right,
-                    tile_draw.uv_top,
-                    tile_draw.uv_bottom,
-                    self.config
-                        .as_ref()
-                        .expect("surface configuration should exist"),
-                );
-                batch_vertices.extend_from_slice(&vertices);
-                batch_draws.push((vertex_start, tile_draw.bind_group));
+                }
+
+                let child_size_px = visible_tile.size_px * 0.5;
+                for (quadrant_x, quadrant_y, tile_draw) in child_draws {
+                    let vertex_start =
+                        batch_vertices.len() as u64 * std::mem::size_of::<TexturedVertex>() as u64;
+                    let vertices = tile_vertices(
+                        TileQuad {
+                            screen_x_px: visible_tile.screen_x_px
+                                + quadrant_x as f32 * child_size_px,
+                            screen_y_px: visible_tile.screen_y_px
+                                + quadrant_y as f32 * child_size_px,
+                            size_px: child_size_px,
+                            uv_left: tile_draw.uv_left,
+                            uv_right: tile_draw.uv_right,
+                            uv_top: tile_draw.uv_top,
+                            uv_bottom: tile_draw.uv_bottom,
+                        },
+                        self.config
+                            .as_ref()
+                            .expect("surface configuration should exist"),
+                    );
+                    batch_vertices.extend_from_slice(&vertices);
+                    batch_draws.push((vertex_start, tile_draw.bind_group));
+                }
+                stats.drawn_visible_tile_ids.push(visible_tile.id);
             }
 
-            if !batch_vertices.is_empty() {
-                stats.drawn_tiles = batch_draws.len();
-                stats.missing_tiles = missing_tiles;
-                self.write_tile_vertices(&batch_vertices);
-                let mut render_pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
-                    label: Some("osm-map-renderer-tile-pass"),
-                    color_attachments: &[Some(wgpu::RenderPassColorAttachment {
-                        view: &view,
-                        resolve_target: None,
-                        ops: wgpu::Operations {
-                            load: wgpu::LoadOp::Load,
-                            store: wgpu::StoreOp::Store,
-                        },
-                        depth_slice: None,
-                    })],
-                    depth_stencil_attachment: None,
-                    timestamp_writes: None,
-                    occlusion_query_set: None,
-                    multiview_mask: None,
-                });
-                render_pass.set_pipeline(&self.quad_pipeline);
+            stats.missing_tiles = missing_tiles;
+        }
 
-                for (vertex_start, bind_group) in batch_draws {
-                    let vertex_end =
-                        vertex_start + (6 * std::mem::size_of::<TexturedVertex>()) as u64;
-                    render_pass.set_bind_group(0, bind_group, &[]);
-                    render_pass.set_vertex_buffer(
-                        0,
-                        self.tile_vertex_buffer.slice(vertex_start..vertex_end),
-                    );
-                    render_pass.draw(0..6, 0..1);
-                }
-            } else {
-                stats.missing_tiles = missing_tiles;
+        if !batch_vertices.is_empty() {
+            stats.drawn_tiles = batch_draws.len();
+            self.write_tile_vertices(&batch_vertices);
+            let mut render_pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                label: Some("osm-map-renderer-tile-pass"),
+                color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                    view: &view,
+                    resolve_target: None,
+                    ops: wgpu::Operations {
+                        load: wgpu::LoadOp::Load,
+                        store: wgpu::StoreOp::Store,
+                    },
+                    depth_slice: None,
+                })],
+                depth_stencil_attachment: None,
+                timestamp_writes: None,
+                occlusion_query_set: None,
+                multiview_mask: None,
+            });
+            render_pass.set_pipeline(&self.quad_pipeline);
+
+            for (vertex_start, bind_group) in batch_draws {
+                let vertex_end = vertex_start + (6 * std::mem::size_of::<TexturedVertex>()) as u64;
+                render_pass.set_bind_group(0, &bind_group, &[]);
+                render_pass
+                    .set_vertex_buffer(0, self.tile_vertex_buffer.slice(vertex_start..vertex_end));
+                render_pass.draw(0..6, 0..1);
             }
         }
 
@@ -1931,10 +2026,10 @@ impl GpuSurface {
             .write_buffer(&self.tile_vertex_buffer, 0, vertex_bytes);
     }
 
-    fn resolve_tile_draw(&self, tile_id: TileId) -> Option<TileDrawRef<'_>> {
-        if let Some(uploaded_tile) = self.uploaded_tiles.peek(&tile_id) {
-            return Some(TileDrawRef {
-                bind_group: &uploaded_tile.bind_group,
+    fn resolve_tile_draw(&mut self, tile_id: TileId) -> Option<TileDraw> {
+        if let Some(uploaded_tile) = self.uploaded_tiles.get_ref_touch(&tile_id) {
+            return Some(TileDraw {
+                bind_group: uploaded_tile.bind_group.clone(),
                 uv_left: 0.0,
                 uv_right: 1.0,
                 uv_top: 0.0,
@@ -1957,14 +2052,14 @@ impl GpuSurface {
                 y: ancestor.y / 2,
             };
 
-            if let Some(uploaded_tile) = self.uploaded_tiles.peek(&ancestor) {
+            if let Some(uploaded_tile) = self.uploaded_tiles.get_ref_touch(&ancestor) {
                 let factor = scale_divisor as f32;
                 let uv_left = child_offset_x as f32 / factor;
                 let uv_right = (child_offset_x + 1) as f32 / factor;
                 let uv_top = child_offset_y as f32 / factor;
                 let uv_bottom = (child_offset_y + 1) as f32 / factor;
-                return Some(TileDrawRef {
-                    bind_group: &uploaded_tile.bind_group,
+                return Some(TileDraw {
+                    bind_group: uploaded_tile.bind_group.clone(),
                     uv_left,
                     uv_right,
                     uv_top,
@@ -1975,49 +2070,83 @@ impl GpuSurface {
 
         None
     }
+
+    fn resolve_child_tile_draws(&mut self, tile_id: TileId) -> Vec<(u8, u8, TileDraw)> {
+        let Some(child_zoom) = tile_id.z.checked_add(1) else {
+            return Vec::new();
+        };
+        if child_zoom > TileId::MAX_ZOOM {
+            return Vec::new();
+        }
+
+        let mut draws = Vec::with_capacity(4);
+        for quadrant_y in 0_u8..2 {
+            for quadrant_x in 0_u8..2 {
+                let Ok(child) = TileId::new(
+                    child_zoom,
+                    tile_id.x * 2 + u32::from(quadrant_x),
+                    tile_id.y * 2 + u32::from(quadrant_y),
+                ) else {
+                    continue;
+                };
+                if let Some(uploaded_tile) = self.uploaded_tiles.get_ref_touch(&child) {
+                    draws.push((
+                        quadrant_x,
+                        quadrant_y,
+                        TileDraw {
+                            bind_group: uploaded_tile.bind_group.clone(),
+                            uv_left: 0.0,
+                            uv_right: 1.0,
+                            uv_top: 0.0,
+                            uv_bottom: 1.0,
+                        },
+                    ));
+                }
+            }
+        }
+        draws
+    }
 }
 
-fn tile_vertices(
-    screen_x_px: f32,
-    screen_y_px: f32,
-    size_px: f32,
-    uv_left: f32,
-    uv_right: f32,
-    uv_top: f32,
-    uv_bottom: f32,
-    config: &wgpu::SurfaceConfiguration,
-) -> [TexturedVertex; 6] {
+fn tile_intersects_viewport(tile: &osm_renderer::VisibleTile, viewport: RenderViewport) -> bool {
+    tile.screen_x_px + tile.size_px > 0.0
+        && tile.screen_x_px < viewport.width_px as f32
+        && tile.screen_y_px + tile.size_px > 0.0
+        && tile.screen_y_px < viewport.height_px as f32
+}
+
+fn tile_vertices(quad: TileQuad, config: &wgpu::SurfaceConfiguration) -> [TexturedVertex; 6] {
     let width = config.width as f32;
     let height = config.height as f32;
-    let left = screen_x_px / width * 2.0 - 1.0;
-    let right = (screen_x_px + size_px) / width * 2.0 - 1.0;
-    let top = 1.0 - screen_y_px / height * 2.0;
-    let bottom = 1.0 - (screen_y_px + size_px) / height * 2.0;
+    let left = quad.screen_x_px / width * 2.0 - 1.0;
+    let right = (quad.screen_x_px + quad.size_px) / width * 2.0 - 1.0;
+    let top = 1.0 - quad.screen_y_px / height * 2.0;
+    let bottom = 1.0 - (quad.screen_y_px + quad.size_px) / height * 2.0;
 
     [
         TexturedVertex {
             position: [left, bottom],
-            uv: [uv_left, uv_bottom],
+            uv: [quad.uv_left, quad.uv_bottom],
         },
         TexturedVertex {
             position: [right, bottom],
-            uv: [uv_right, uv_bottom],
+            uv: [quad.uv_right, quad.uv_bottom],
         },
         TexturedVertex {
             position: [right, top],
-            uv: [uv_right, uv_top],
+            uv: [quad.uv_right, quad.uv_top],
         },
         TexturedVertex {
             position: [left, bottom],
-            uv: [uv_left, uv_bottom],
+            uv: [quad.uv_left, quad.uv_bottom],
         },
         TexturedVertex {
             position: [right, top],
-            uv: [uv_right, uv_top],
+            uv: [quad.uv_right, quad.uv_top],
         },
         TexturedVertex {
             position: [left, top],
-            uv: [uv_left, uv_top],
+            uv: [quad.uv_left, quad.uv_top],
         },
     ]
 }
@@ -2026,5 +2155,82 @@ fn bytes_of<T>(slice: &[T]) -> &[u8] {
     unsafe { std::slice::from_raw_parts(slice.as_ptr().cast::<u8>(), std::mem::size_of_val(slice)) }
 }
 
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn tile(z: u32, x: u32, y: u32) -> TileId {
+        TileId::new(z, x, y).unwrap()
+    }
+
+    fn request(id: TileId, generation: u64, priority: f32) -> TileLoadRequest {
+        TileLoadRequest {
+            id,
+            metadata: TileRequestMetadata { generation },
+            priority,
+        }
+    }
+
+    #[test]
+    fn queue_tile_request_keeps_best_request_per_tile() {
+        let id = tile(4, 8, 8);
+        let mut queued = BinaryHeap::new();
+        let mut queued_best = HashMap::new();
+
+        queue_tile_request(&mut queued, &mut queued_best, request(id, 1, 1_000.0));
+        queue_tile_request(&mut queued, &mut queued_best, request(id, 1, 5_000.0));
+        queue_tile_request(&mut queued, &mut queued_best, request(id, 2, 3_000.0));
+
+        assert!(same_tile_request(
+            *queued_best.get(&id).unwrap(),
+            request(id, 1, 5_000.0)
+        ));
+    }
+
+    #[test]
+    fn queue_tile_request_replaces_equal_priority_with_newer_generation() {
+        let id = tile(4, 8, 8);
+        let mut queued = BinaryHeap::new();
+        let mut queued_best = HashMap::new();
+
+        queue_tile_request(&mut queued, &mut queued_best, request(id, 1, 5_000.0));
+        queue_tile_request(&mut queued, &mut queued_best, request(id, 2, 5_000.0));
+
+        assert!(same_tile_request(
+            *queued_best.get(&id).unwrap(),
+            request(id, 2, 5_000.0)
+        ));
+    }
+
+    #[test]
+    fn remember_drawn_tiles_keeps_recent_partial_history() {
+        let (tx, _rx) = mpsc::channel();
+        let mut worker = RendererWorker::new(RenderState::new(), tx);
+        worker.last_stable_tile_ids = vec![tile(4, 9, 8), tile(4, 10, 8)];
+
+        worker.remember_drawn_tiles(&[tile(4, 8, 8), tile(4, 9, 8)]);
+
+        assert_eq!(
+            worker.last_stable_tile_ids,
+            vec![tile(4, 8, 8), tile(4, 9, 8), tile(4, 10, 8)]
+        );
+    }
+
+    #[test]
+    fn late_tile_is_kept_when_it_still_intersects_current_viewport() {
+        let (tx, _rx) = mpsc::channel();
+        let mut state = RenderState::new();
+        state
+            .set_viewport(RenderViewport::new(512, 512, 1.0).unwrap())
+            .unwrap();
+        state
+            .set_camera(MapCamera::new(0.0, 0.0, 4.25).unwrap())
+            .unwrap();
+        let worker = RendererWorker::new(state, tx);
+
+        assert!(worker.should_keep_late_tile(tile(3, 4, 4)));
+        assert!(!worker.should_keep_late_tile(tile(8, 0, 0)));
+    }
+}
 
 mod jni_bridge;

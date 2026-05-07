@@ -293,10 +293,12 @@ impl OsmTileEngine {
             })
     }
 
+    #[cfg(feature = "android-renderer")]
     pub(crate) fn shared_source(&self) -> CachedTileSource<HttpTileSource> {
         self.source.clone()
     }
 
+    #[cfg(feature = "android-renderer")]
     pub(crate) fn tile_url_template(&self) -> String {
         self.source.source().url_template().to_owned()
     }

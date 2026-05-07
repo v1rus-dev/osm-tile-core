@@ -1,6 +1,9 @@
 use async_trait::async_trait;
 use reqwest::header::{ACCEPT, HeaderValue};
+use std::collections::HashMap;
+use std::sync::Arc;
 use std::time::Duration;
+use tokio::sync::{Mutex, Notify, futures::OwnedNotified};
 
 use crate::{FileTileCache, TileError, TileId};
 
@@ -77,11 +80,16 @@ impl TileSource for HttpTileSource {
 pub struct CachedTileSource<S> {
     source: S,
     cache: FileTileCache,
+    in_flight: Arc<Mutex<HashMap<TileId, Arc<Notify>>>>,
 }
 
 impl<S> CachedTileSource<S> {
     pub fn new(source: S, cache: FileTileCache) -> Self {
-        Self { source, cache }
+        Self {
+            source,
+            cache,
+            in_flight: Arc::new(Mutex::new(HashMap::new())),
+        }
     }
 
     pub fn cache(&self) -> &FileTileCache {
@@ -99,14 +107,62 @@ where
     S: TileSource,
 {
     async fn load_tile(&self, id: TileId) -> Result<Vec<u8>, TileError> {
+        let id = id.validate()?;
+
         if let Some(bytes) = self.cache.get(id).await? {
             return Ok(bytes);
         }
 
-        let bytes = self.source.load_tile(id).await?;
-        self.cache.put(id, &bytes).await?;
+        loop {
+            let load_state = self.begin_tile_load(id).await;
+            match load_state {
+                TileLoadState::Leader(notify) => {
+                    let result = async {
+                        if let Some(bytes) = self.cache.get(id).await? {
+                            return Ok(bytes);
+                        }
 
-        Ok(bytes)
+                        let bytes = self.source.load_tile(id).await?;
+                        self.cache.put(id, &bytes).await?;
+
+                        Ok(bytes)
+                    }
+                    .await;
+
+                    self.finish_tile_load(id, notify).await;
+                    return result;
+                }
+                TileLoadState::Follower(notified) => {
+                    notified.await;
+                    if let Some(bytes) = self.cache.get(id).await? {
+                        return Ok(bytes);
+                    }
+                }
+            }
+        }
+    }
+}
+
+enum TileLoadState {
+    Leader(Arc<Notify>),
+    Follower(OwnedNotified),
+}
+
+impl<S> CachedTileSource<S> {
+    async fn begin_tile_load(&self, id: TileId) -> TileLoadState {
+        let mut in_flight = self.in_flight.lock().await;
+        if let Some(notify) = in_flight.get(&id) {
+            return TileLoadState::Follower(notify.clone().notified_owned());
+        }
+
+        let notify = Arc::new(Notify::new());
+        in_flight.insert(id, notify.clone());
+        TileLoadState::Leader(notify)
+    }
+
+    async fn finish_tile_load(&self, id: TileId, notify: Arc<Notify>) {
+        self.in_flight.lock().await.remove(&id);
+        notify.notify_waiters();
     }
 }
 
@@ -132,6 +188,22 @@ mod tests {
     impl TileSource for CountingTileSource {
         async fn load_tile(&self, _id: TileId) -> Result<Vec<u8>, TileError> {
             self.calls.fetch_add(1, Ordering::SeqCst);
+            Ok(self.bytes.clone())
+        }
+    }
+
+    #[derive(Debug)]
+    struct SlowCountingTileSource {
+        calls: Arc<AtomicUsize>,
+        bytes: Vec<u8>,
+        delay: Duration,
+    }
+
+    #[async_trait]
+    impl TileSource for SlowCountingTileSource {
+        async fn load_tile(&self, _id: TileId) -> Result<Vec<u8>, TileError> {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            std::thread::sleep(self.delay);
             Ok(self.bytes.clone())
         }
     }
@@ -207,6 +279,37 @@ mod tests {
             cache.get(id).await.unwrap(),
             Some(b"downloaded tile".to_vec())
         );
+
+        let _ = fs::remove_dir_all(&root).await;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn cached_source_coalesces_concurrent_misses_for_same_tile() {
+        let root = temp_cache_dir("coalesced-miss");
+        let _ = fs::remove_dir_all(&root).await;
+
+        let calls = Arc::new(AtomicUsize::new(0));
+        let source = SlowCountingTileSource {
+            calls: calls.clone(),
+            bytes: b"downloaded once".to_vec(),
+            delay: Duration::from_millis(50),
+        };
+        let cache = FileTileCache::new(&root);
+        let cached_source = Arc::new(CachedTileSource::new(source, cache));
+        let id = TileId::new(6, 10, 11).unwrap();
+
+        let mut handles = Vec::new();
+        for _ in 0..8 {
+            let cached_source = cached_source.clone();
+            handles.push(tokio::spawn(async move {
+                cached_source.load_tile(id).await.unwrap()
+            }));
+        }
+
+        for handle in handles {
+            assert_eq!(handle.await.unwrap(), b"downloaded once".to_vec());
+        }
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
 
         let _ = fs::remove_dir_all(&root).await;
     }
