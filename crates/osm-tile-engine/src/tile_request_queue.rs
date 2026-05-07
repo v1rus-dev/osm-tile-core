@@ -63,6 +63,14 @@ pub(crate) fn prune_queued_requests(
     queued_best.retain(|tile_id, _| retained_tiles.contains(tile_id));
 }
 
+pub(crate) fn rebuild_queued_requests(
+    queued: &mut BinaryHeap<PrioritizedTileRequest>,
+    queued_best: &HashMap<TileId, TileLoadRequest>,
+) {
+    queued.clear();
+    queued.extend(queued_best.values().copied().map(PrioritizedTileRequest));
+}
+
 pub(crate) fn pending_metadata_matches(
     pending_metadata: &HashMap<TileId, TileRequestMetadata>,
     id: TileId,
@@ -145,6 +153,22 @@ mod tests {
 
         assert!(queued_best.contains_key(&retained));
         assert!(!queued_best.contains_key(&stale));
+    }
+
+    #[test]
+    fn rebuild_queued_requests_drops_stale_heap_entries() {
+        let retained = tile(4, 8, 8);
+        let stale = tile(4, 9, 8);
+        let mut queued = BinaryHeap::new();
+        let mut queued_best = HashMap::new();
+
+        queue_tile_request(&mut queued, &mut queued_best, request(retained, 1, 5_000.0));
+        queue_tile_request(&mut queued, &mut queued_best, request(stale, 1, 4_000.0));
+        prune_queued_requests(&mut queued_best, &HashSet::from([retained]));
+        rebuild_queued_requests(&mut queued, &queued_best);
+
+        assert_eq!(queued.len(), 1);
+        assert_eq!(queued.pop().unwrap().0.id, retained);
     }
 
     #[test]

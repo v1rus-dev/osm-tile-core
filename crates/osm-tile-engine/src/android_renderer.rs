@@ -1,4 +1,4 @@
-use std::collections::{BinaryHeap, HashMap, HashSet, VecDeque};
+use std::collections::{BinaryHeap, HashMap, HashSet};
 use std::ffi::{CString, c_char, c_int, c_void};
 use std::path::PathBuf;
 use std::ptr::NonNull;
@@ -12,7 +12,7 @@ use std::time::{Duration, Instant};
 use crate::mobile::OsmTileEngine;
 use crate::tile_request_queue::{
     PrioritizedTileRequest, TileLoadRequest, TileRequestMetadata, pending_metadata_matches,
-    prune_queued_requests, queue_tile_request, same_tile_request,
+    prune_queued_requests, queue_tile_request, rebuild_queued_requests, same_tile_request,
 };
 use crate::tile_retention::should_evict_for_zoom;
 use image::GenericImageView;
@@ -79,7 +79,7 @@ const TELEMETRY_LOG_INTERVAL: Duration = Duration::from_secs(1);
 const MOVING_UPLOADS_PER_FRAME: usize = 1;
 const IDLE_UPLOADS_PER_FRAME: usize = 2;
 const URGENT_UPLOADS_PER_FRAME: usize = 4;
-const RECENT_TILE_HISTORY_LIMIT: usize = 128;
+const RECENT_TILE_HISTORY_LIMIT: usize = 32;
 
 #[derive(Debug, Clone, Copy)]
 struct TileCacheLimits {
@@ -179,19 +179,26 @@ fn avg_ms(total_ns: u128, count: u64) -> f64 {
 
 #[derive(Debug)]
 struct SizedLruCache<T> {
-    entries: HashMap<TileId, (T, usize)>,
-    order: VecDeque<TileId>,
+    entries: HashMap<TileId, CacheEntry<T>>,
     current_size_bytes: usize,
     size_limit_bytes: usize,
+    access_tick: u64,
+}
+
+#[derive(Debug)]
+struct CacheEntry<T> {
+    value: T,
+    size_bytes: usize,
+    last_used_tick: u64,
 }
 
 impl<T> SizedLruCache<T> {
     fn new(size_limit_bytes: usize) -> Self {
         Self {
             entries: HashMap::new(),
-            order: VecDeque::new(),
             current_size_bytes: 0,
             size_limit_bytes,
+            access_tick: 0,
         }
     }
 
@@ -199,74 +206,64 @@ impl<T> SizedLruCache<T> {
         self.entries.contains_key(key)
     }
 
-    fn touch(&mut self, key: TileId) {
-        if let Some(pos) = self.order.iter().position(|candidate| *candidate == key) {
-            self.order.remove(pos);
-        }
-        self.order.push_back(key);
-    }
-
     fn insert(&mut self, key: TileId, value: T, size_bytes: usize) {
-        if let Some((_, (_, previous_size))) = self.entries.remove_entry(&key) {
-            self.current_size_bytes = self.current_size_bytes.saturating_sub(previous_size);
-            if let Some(pos) = self.order.iter().position(|candidate| *candidate == key) {
-                self.order.remove(pos);
-            }
+        let tick = self.next_access_tick();
+        if let Some(previous) = self.entries.insert(
+            key,
+            CacheEntry {
+                value,
+                size_bytes,
+                last_used_tick: tick,
+            },
+        ) {
+            self.current_size_bytes = self.current_size_bytes.saturating_sub(previous.size_bytes);
         }
         self.current_size_bytes = self.current_size_bytes.saturating_add(size_bytes);
-        self.order.push_back(key);
-        self.entries.insert(key, (value, size_bytes));
-    }
-
-    fn get_cloned(&mut self, key: &TileId) -> Option<T>
-    where
-        T: Clone,
-    {
-        let value = self.entries.get(key).map(|(value, _)| value).cloned();
-        if value.is_some() {
-            self.touch(*key);
-        }
-        value
     }
 
     fn get_ref_touch(&mut self, key: &TileId) -> Option<&T> {
-        if self.entries.contains_key(key) {
-            self.touch(*key);
-        }
-        self.entries.get(key).map(|(value, _)| value)
+        let tick = self.next_access_tick();
+        self.entries.get_mut(key).map(|entry| {
+            entry.last_used_tick = tick;
+            &entry.value
+        })
+    }
+
+    fn with_ref_touch<R>(&mut self, key: &TileId, f: impl FnOnce(&T) -> R) -> Option<R> {
+        let tick = self.next_access_tick();
+        self.entries.get_mut(key).map(|entry| {
+            entry.last_used_tick = tick;
+            f(&entry.value)
+        })
     }
 
     fn remove(&mut self, key: &TileId) -> Option<T> {
-        let (value, size_bytes) = self.entries.remove(key)?;
-        self.current_size_bytes = self.current_size_bytes.saturating_sub(size_bytes);
-        if let Some(pos) = self.order.iter().position(|candidate| candidate == key) {
-            self.order.remove(pos);
-        }
-        Some(value)
+        let entry = self.entries.remove(key)?;
+        self.current_size_bytes = self.current_size_bytes.saturating_sub(entry.size_bytes);
+        Some(entry.value)
     }
 
     fn evict_one(&mut self, visible_tiles: &HashSet<TileId>) -> Option<TileId> {
-        let mut fallback = None;
-        for (idx, candidate) in self.order.iter().enumerate() {
-            if fallback.is_none() {
-                fallback = Some((idx, *candidate));
-            }
-            if !visible_tiles.contains(candidate) {
-                return Some(self.evict_at(idx));
-            }
-        }
-        fallback.map(|(idx, _)| self.evict_at(idx))
+        let candidate = self
+            .entries
+            .iter()
+            .filter(|(tile_id, _)| !visible_tiles.contains(tile_id))
+            .min_by_key(|(_, entry)| entry.last_used_tick)
+            .map(|(tile_id, _)| *tile_id)
+            .or_else(|| {
+                self.entries
+                    .iter()
+                    .min_by_key(|(_, entry)| entry.last_used_tick)
+                    .map(|(tile_id, _)| *tile_id)
+            })?;
+
+        self.remove(&candidate)?;
+        Some(candidate)
     }
 
-    fn evict_at(&mut self, idx: usize) -> TileId {
-        let key = self
-            .order
-            .remove(idx)
-            .expect("cache order index should exist");
-        if let Some((_, size_bytes)) = self.entries.remove(&key) {
-            self.current_size_bytes = self.current_size_bytes.saturating_sub(size_bytes);
-        }
-        key
+    fn next_access_tick(&mut self) -> u64 {
+        self.access_tick = self.access_tick.saturating_add(1);
+        self.access_tick
     }
 }
 
@@ -949,7 +946,10 @@ impl RendererWorker {
             None
         };
 
-        let stale_tiles = self.stale_tiles_for_current_camera();
+        let visible_tile_ids = visible_tiles
+            .as_ref()
+            .map(|tiles| tiles.iter().map(|tile| tile.id).collect::<HashSet<_>>())
+            .unwrap_or_default();
         if let Some(visible_tiles) = visible_tiles.as_ref() {
             let request_plan = self.build_tile_request_plan(visible_tiles);
             self.protected_tile_ids = request_plan.tiles().iter().map(|tile| tile.id).collect();
@@ -959,6 +959,7 @@ impl RendererWorker {
         } else {
             self.protected_tile_ids.clear();
         }
+        let stale_tiles = self.stale_tiles_for_current_camera(&visible_tile_ids);
 
         let mut stats = visible_tiles
             .as_ref()
@@ -1088,13 +1089,19 @@ impl RendererWorker {
                 continue;
             }
 
-            let Some(tile_data) = self.loaded_tiles.get_cloned(&tile_id) else {
+            let Some(gpu) = self.gpu.as_mut() else {
                 continue;
             };
-            if let Some(gpu) = self.gpu.as_mut()
-                && !gpu.uploaded_tiles.contains_key(&tile_id)
-            {
-                gpu.upload_tile(tile_id, &tile_data, &mut self.telemetry);
+            if gpu.uploaded_tiles.contains_key(&tile_id) {
+                continue;
+            }
+            let uploaded = self
+                .loaded_tiles
+                .with_ref_touch(&tile_id, |tile_data| {
+                    gpu.upload_tile(tile_id, tile_data, &mut self.telemetry);
+                })
+                .is_some();
+            if uploaded {
                 uploads_this_frame += 1;
             }
         }
@@ -1312,6 +1319,7 @@ impl RendererWorker {
         if !changed {
             return;
         }
+        self.last_stable_tile_ids.clear();
         let max_distance = u32::from(self.cache_limits.max_zoom_distance_to_keep);
         let stale_loaded: Vec<TileId> = self
             .loaded_tiles
@@ -1355,15 +1363,20 @@ impl RendererWorker {
         }
     }
 
-    fn stale_tiles_for_current_camera(&self) -> Vec<osm_renderer::VisibleTile> {
+    fn stale_tiles_for_current_camera(
+        &self,
+        visible_tile_ids: &HashSet<TileId>,
+    ) -> Vec<osm_renderer::VisibleTile> {
         let Some(viewport) = self.state.viewport() else {
             return Vec::new();
         };
         let camera = self.state.camera();
         self.last_stable_tile_ids
             .iter()
+            .filter(|tile_id| !visible_tile_ids.contains(tile_id))
             .filter_map(|tile_id| position_tile(camera, viewport, *tile_id).ok())
             .filter(|tile| tile_intersects_viewport(tile, viewport))
+            .take(RECENT_TILE_HISTORY_LIMIT)
             .collect()
     }
 
@@ -1493,10 +1506,10 @@ fn tile_loader_loop(
             {
                 continue;
             }
-            queued_best.remove(&request.id);
             if active_fetches.contains(&request.id) {
                 continue;
             }
+            queued_best.remove(&request.id);
             let source = source.clone();
             active_fetches.insert(request.id);
             in_flight_fetches.spawn_on(
@@ -1540,6 +1553,7 @@ fn tile_loader_loop(
                     tile_ids,
                 } => {
                     prune_queued_requests(&mut queued_best, &tile_ids);
+                    rebuild_queued_requests(&mut queued, &queued_best);
                     log_debug(format!(
                         "tile loader pruned queued requests generation={} retained={}",
                         generation,
@@ -1570,6 +1584,9 @@ fn tile_loader_loop(
             match decoded_rx.try_recv() {
                 Ok(result) => {
                     active_fetches.remove(&result.id);
+                    if let Some(request) = queued_best.get(&result.id).copied() {
+                        queued.push(PrioritizedTileRequest(request));
+                    }
                     if result.tile.is_none() {
                         let cache = source.cache().clone();
                         if let Err(error) = runtime.block_on(cache.remove(result.id)) {
@@ -1596,6 +1613,10 @@ fn tile_loader_loop(
                 Err(TryRecvError::Empty) => break,
                 Err(TryRecvError::Disconnected) => break,
             }
+        }
+
+        if queued.len() > queued_best.len().saturating_mul(4).saturating_add(32) {
+            rebuild_queued_requests(&mut queued, &queued_best);
         }
 
         if shutting_down
@@ -1914,6 +1935,7 @@ impl GpuSurface {
             let mut missing_tiles = 0_usize;
 
             for visible_tile in visible_tiles {
+                let has_direct_tile = self.uploaded_tiles.contains_key(&visible_tile.id);
                 if let Some(tile_draw) = self.resolve_tile_draw(visible_tile.id) {
                     let vertex_start =
                         batch_vertices.len() as u64 * std::mem::size_of::<TexturedVertex>() as u64;
@@ -1933,7 +1955,9 @@ impl GpuSurface {
                     );
                     batch_vertices.extend_from_slice(&vertices);
                     batch_draws.push((vertex_start, tile_draw.bind_group));
-                    stats.drawn_visible_tile_ids.push(visible_tile.id);
+                    if has_direct_tile {
+                        stats.drawn_visible_tile_ids.push(visible_tile.id);
+                    }
                     continue;
                 }
 
@@ -1966,7 +1990,6 @@ impl GpuSurface {
                     batch_vertices.extend_from_slice(&vertices);
                     batch_draws.push((vertex_start, tile_draw.bind_group));
                 }
-                stats.drawn_visible_tile_ids.push(visible_tile.id);
             }
 
             stats.missing_tiles = missing_tiles;
@@ -2203,6 +2226,37 @@ mod tests {
     }
 
     #[test]
+    fn lru_cache_touch_does_not_grow_entries() {
+        let mut cache = SizedLruCache::new(10);
+        let id = tile(4, 8, 8);
+
+        cache.insert(id, "tile", 1);
+        cache.get_ref_touch(&id);
+        cache.get_ref_touch(&id);
+
+        assert_eq!(cache.entries.len(), 1);
+        assert_eq!(cache.current_size_bytes, 1);
+    }
+
+    #[test]
+    fn lru_cache_evicts_oldest_unprotected_tile() {
+        let mut cache = SizedLruCache::new(2);
+        let old = tile(4, 8, 8);
+        let protected = tile(4, 9, 8);
+        let recent = tile(4, 10, 8);
+
+        cache.insert(old, "old", 1);
+        cache.insert(protected, "protected", 1);
+        cache.insert(recent, "recent", 1);
+        cache.get_ref_touch(&recent);
+
+        assert_eq!(cache.evict_one(&HashSet::from([protected])), Some(old));
+        assert!(!cache.contains_key(&old));
+        assert!(cache.contains_key(&protected));
+        assert!(cache.contains_key(&recent));
+    }
+
+    #[test]
     fn remember_drawn_tiles_keeps_recent_partial_history() {
         let (tx, _rx) = mpsc::channel();
         let mut worker = RendererWorker::new(RenderState::new(), tx);
@@ -2214,6 +2268,83 @@ mod tests {
             worker.last_stable_tile_ids,
             vec![tile(4, 8, 8), tile(4, 9, 8), tile(4, 10, 8)]
         );
+    }
+
+    #[test]
+    fn remember_drawn_tiles_limits_recent_history() {
+        let (tx, _rx) = mpsc::channel();
+        let mut worker = RendererWorker::new(RenderState::new(), tx);
+        let ids = (0..64).map(|x| tile(6, x, 20)).collect::<Vec<_>>();
+
+        worker.remember_drawn_tiles(&ids);
+
+        assert_eq!(worker.last_stable_tile_ids.len(), RECENT_TILE_HISTORY_LIMIT);
+        assert_eq!(worker.last_stable_tile_ids[0], ids[0]);
+    }
+
+    #[test]
+    fn zoom_change_clears_stale_tile_history() {
+        let (tx, _rx) = mpsc::channel();
+        let mut worker = RendererWorker::new(RenderState::new(), tx);
+        worker.last_visible_zoom = Some(4);
+        worker.last_stable_tile_ids = vec![tile(4, 8, 8)];
+        let visible_tiles = [osm_renderer::VisibleTile {
+            id: tile(5, 16, 16),
+            screen_x_px: 0.0,
+            screen_y_px: 0.0,
+            size_px: 256.0,
+        }];
+
+        worker.evict_far_zoom_layers(&visible_tiles);
+
+        assert!(worker.last_stable_tile_ids.is_empty());
+    }
+
+    #[test]
+    fn stale_tiles_skip_current_visible_ids() {
+        let (tx, _rx) = mpsc::channel();
+        let mut state = RenderState::new();
+        state
+            .set_viewport(RenderViewport::new(512, 512, 1.0).unwrap())
+            .unwrap();
+        state
+            .set_camera(MapCamera::new(0.0, 0.0, 4.0).unwrap())
+            .unwrap();
+        let mut worker = RendererWorker::new(state, tx);
+        let visible = tile(4, 8, 8);
+        worker.last_stable_tile_ids = vec![visible];
+
+        let stale_tiles = worker.stale_tiles_for_current_camera(&HashSet::from([visible]));
+
+        assert!(stale_tiles.is_empty());
+    }
+
+    #[test]
+    fn active_tile_keeps_newer_queued_request_for_later() {
+        let id = tile(4, 8, 8);
+        let mut queued = BinaryHeap::new();
+        let mut queued_best = HashMap::new();
+        let mut active_fetches = HashSet::new();
+
+        queue_tile_request(&mut queued, &mut queued_best, request(id, 1, 4_000.0));
+        let first = queued.pop().unwrap().0;
+        queued_best.remove(&first.id);
+        active_fetches.insert(first.id);
+
+        queue_tile_request(&mut queued, &mut queued_best, request(id, 2, 5_000.0));
+        let active_duplicate = queued.pop().unwrap().0;
+        assert!(active_fetches.contains(&active_duplicate.id));
+        assert!(queued_best.contains_key(&active_duplicate.id));
+
+        active_fetches.remove(&id);
+        if let Some(request) = queued_best.get(&id).copied() {
+            queued.push(PrioritizedTileRequest(request));
+        }
+
+        assert!(same_tile_request(
+            queued.pop().unwrap().0,
+            request(id, 2, 5_000.0)
+        ));
     }
 
     #[test]
