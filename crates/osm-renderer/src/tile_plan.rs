@@ -131,7 +131,8 @@ impl TileBounds {
         let mut max_y = i64::MIN;
 
         for tile in visible_tiles.iter().filter(|tile| tile.id.z == zoom) {
-            let x = unwrap_x(tile.id.x as i64, base_x, limit);
+            let unwrapped_x = tile.overscaled_id.wrap as i64 * limit + tile.id.x as i64;
+            let x = unwrap_x(unwrapped_x, base_x, limit);
             min_x = min_x.min(x);
             max_x = max_x.max(x);
             min_y = min_y.min(tile.id.y as i64);
@@ -325,6 +326,8 @@ fn unwrap_x(x: i64, base_x: i64, limit: i64) -> i64 {
 
 #[cfg(test)]
 mod tests {
+    use osm_core::OverscaledTileId;
+
     use super::*;
 
     fn tile(z: u32, x: u32, y: u32) -> TileId {
@@ -334,6 +337,7 @@ mod tests {
     fn visible(id: TileId) -> VisibleTile {
         VisibleTile {
             id,
+            overscaled_id: OverscaledTileId::from_canonical(id, 0),
             screen_x_px: 0.0,
             screen_y_px: 0.0,
             size_px: 256.0,

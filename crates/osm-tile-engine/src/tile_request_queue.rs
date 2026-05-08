@@ -103,7 +103,7 @@ impl TileRequestScheduler {
         self.retained_tiles = tile_ids;
 
         let previous_len = self.queued_best.len();
-        prune_queued_requests(&mut self.queued_best, &self.retained_tiles);
+        soft_prune_queued_requests(&mut self.queued_best, &self.retained_tiles, current_zoom);
         let pruned = previous_len.saturating_sub(self.queued_best.len());
         rebuild_queued_requests(&mut self.queued, &self.queued_best);
         pruned
@@ -164,13 +164,13 @@ impl TileRequestScheduler {
 
     fn is_request_retained(&self, request: TileLoadRequest) -> bool {
         self.current_zoom.is_none()
-            || (self.retained_tiles.contains(&request.id)
-                && (request.lane == TileRequestLane::FallbackParent
-                    || request
-                        .id
-                        .z
-                        .abs_diff(self.current_zoom.unwrap_or(request.id.z))
-                        <= MAX_NON_FALLBACK_ZOOM_DISTANCE))
+            || self.retained_tiles.contains(&request.id)
+            || request.lane == TileRequestLane::FallbackParent
+            || request
+                .id
+                .z
+                .abs_diff(self.current_zoom.unwrap_or(request.id.z))
+                <= MAX_NON_FALLBACK_ZOOM_DISTANCE
     }
 
     fn is_request_stale(&self, request: TileLoadRequest) -> bool {
@@ -193,11 +193,28 @@ pub(crate) fn queue_tile_request(
     }
 }
 
+#[cfg(test)]
 pub(crate) fn prune_queued_requests(
     queued_best: &mut HashMap<TileId, TileLoadRequest>,
     retained_tiles: &HashSet<TileId>,
 ) {
     queued_best.retain(|tile_id, _| retained_tiles.contains(tile_id));
+}
+
+fn soft_prune_queued_requests(
+    queued_best: &mut HashMap<TileId, TileLoadRequest>,
+    retained_tiles: &HashSet<TileId>,
+    current_zoom: u32,
+) {
+    queued_best.retain(|tile_id, request| {
+        if retained_tiles.contains(tile_id) {
+            return true;
+        }
+        if request.lane == TileRequestLane::FallbackParent {
+            return true;
+        }
+        tile_id.z.abs_diff(current_zoom) <= MAX_NON_FALLBACK_ZOOM_DISTANCE
+    });
 }
 
 pub(crate) fn rebuild_queued_requests(
@@ -435,7 +452,7 @@ mod tests {
     #[test]
     fn scheduler_retain_plan_prunes_requests_outside_current_plan() {
         let retained = tile(4, 8, 8);
-        let stale = tile(4, 9, 8);
+        let stale = tile(8, 9, 8);
         let mut scheduler = TileRequestScheduler::new();
         scheduler.queue(request(retained, 1, 5_000.0));
         scheduler.queue(request(stale, 1, 5_000.0));
@@ -445,6 +462,26 @@ mod tests {
         assert_eq!(pruned, 1);
         assert_eq!(scheduler.pop_next(&HashSet::new()).unwrap().id, retained);
         assert!(scheduler.pop_next(&HashSet::new()).is_none());
+    }
+
+    #[test]
+    fn scheduler_retain_plan_keeps_near_zoom_tiles() {
+        let retained = tile(4, 8, 8);
+        let near_zoom = tile(5, 16, 16);
+        let mut scheduler = TileRequestScheduler::new();
+        scheduler.queue(request(retained, 1, 5_000.0));
+        scheduler.queue(request(near_zoom, 1, 5_000.0));
+
+        let pruned = scheduler.retain_plan(1, 4, HashSet::from([retained]));
+
+        assert_eq!(pruned, 0);
+        let first = scheduler.pop_next(&HashSet::new()).unwrap().id;
+        let second = scheduler.pop_next(&HashSet::new()).unwrap().id;
+        assert!(
+            (first == retained && second == near_zoom)
+                || (first == near_zoom && second == retained),
+            "both tiles should be retained"
+        );
     }
 
     #[test]

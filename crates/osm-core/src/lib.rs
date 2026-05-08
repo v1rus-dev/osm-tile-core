@@ -7,7 +7,7 @@ pub mod zoom;
 pub use error::CoreError;
 pub use geo::{GeoBounds, GeoPoint, Viewport, validate_latitude, validate_longitude};
 pub use projection::{MapProjection, WEB_MERCATOR_MAX_LAT};
-pub use tile_id::TileId;
+pub use tile_id::{FadeState, OverscaledTileId, TileId, TileState};
 pub use zoom::{
     EQUATOR_M_PER_PIXEL_Z0, MAX_ZOOM, MIN_ZOOM, OSM_STANDARD_MAX_ZOOM, TILE_SIZE_PX,
     lower_tile_zoom, meters_per_pixel, nearest_zoom_level, tile_count, tile_count_per_axis,

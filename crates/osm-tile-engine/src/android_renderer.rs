@@ -23,7 +23,7 @@ use osm_core::TileId;
 use osm_loader::{CachedTileSource, FileTileCache, HttpTileSource, TileSource};
 use osm_renderer::{
     LayerId, MapCamera, MapLayer, RenderState, RenderViewport, TileLayer, TileLoadPlan,
-    TilePlanOptions, TilePlanPriority, plan_tile_loads, position_tile,
+    TilePlanOptions, TilePlanPriority, TileStore, plan_tile_loads, position_tile,
 };
 
 const DEFAULT_TILE_LAYER_ID: &str = "base";
@@ -80,6 +80,7 @@ const MOVING_UPLOADS_PER_FRAME: usize = 1;
 const IDLE_UPLOADS_PER_FRAME: usize = 2;
 const URGENT_UPLOADS_PER_FRAME: usize = 4;
 const RECENT_TILE_HISTORY_LIMIT: usize = 32;
+const SCHEDULER_UPDATE_INTERVAL: Duration = Duration::from_millis(100);
 
 #[derive(Debug, Clone, Copy)]
 struct TileCacheLimits {
@@ -625,8 +626,10 @@ struct RendererWorker {
     state: RenderState,
     surface_width_px: u32,
     surface_height_px: u32,
+    tile_store: TileStore,
     loaded_tiles: SizedLruCache<LoadedTile>,
     pending_tile_loads: HashSet<TileId>,
+    failed_tile_ids: HashSet<TileId>,
     pending_metadata: HashMap<TileId, TileRequestMetadata>,
     request_generation: u64,
     last_camera_center: Option<(f64, f64)>,
@@ -644,6 +647,9 @@ struct RendererWorker {
     pending_camera: Option<MapCamera>,
     needs_render: bool,
     render_in_flight: bool,
+    last_scheduler_update: Option<Instant>,
+    last_visible_tile_ids: HashSet<TileId>,
+    last_integer_zoom: Option<u32>,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -681,8 +687,10 @@ impl RendererWorker {
             state,
             surface_width_px: 0,
             surface_height_px: 0,
+            tile_store: TileStore::with_default_capacity(),
             loaded_tiles: SizedLruCache::new(TileCacheLimits::default().ram_bytes),
             pending_tile_loads: HashSet::new(),
+            failed_tile_ids: HashSet::new(),
             pending_metadata: HashMap::new(),
             request_generation: 0,
             last_camera_center: None,
@@ -704,9 +712,12 @@ impl RendererWorker {
             last_visible_zoom: None,
             protected_tile_ids: HashSet::new(),
             last_stable_tile_ids: Vec::new(),
-            pending_camera: None,
+            pending_camera: Option::None,
             needs_render: false,
             render_in_flight: false,
+            last_scheduler_update: None,
+            last_visible_tile_ids: HashSet::new(),
+            last_integer_zoom: None,
         }
     }
 
@@ -844,10 +855,18 @@ impl RendererWorker {
                                     "tile z={} x={} y={} failed: {}",
                                     id.z, id.x, id.y, error
                                 ));
+                                self.tile_store.mark_error(id);
+                                self.failed_tile_ids.insert(id);
+                                self.pending_tile_loads.remove(&id);
+                                self.pending_metadata.remove(&id);
+                                self.pending_tile_priorities.remove(&id);
                             }
-                            if let Some(tile) = tile {
-                                let size_bytes = tile.rgba.len();
-                                self.loaded_tiles.insert(id, tile, size_bytes);
+                            if let Some(tile_data) = tile {
+                                let size_bytes = tile_data.rgba.len();
+                                let rgba = tile_data.rgba.clone();
+                                self.loaded_tiles.insert(id, tile_data, size_bytes);
+                                self.tile_store.mark_loaded(id, rgba);
+                                self.tile_store.mark_complete(id);
                                 self.telemetry.decoded_hit += 1;
                             } else {
                                 self.telemetry.decoded_miss += 1;
@@ -973,11 +992,26 @@ impl RendererWorker {
             .map(|tiles| tiles.iter().map(|tile| tile.id).collect::<HashSet<_>>())
             .unwrap_or_default();
         if let Some(visible_tiles) = visible_tiles.as_ref() {
-            let request_plan = self.build_tile_request_plan(visible_tiles);
-            self.protected_tile_ids = request_plan.tiles().iter().map(|tile| tile.id).collect();
-            self.evict_far_zoom_layers(visible_tiles);
-            self.ensure_planned_tiles(visible_tiles, &request_plan);
-            self.enforce_cache_limits(visible_tiles);
+            let update_scheduler = self.should_update_scheduler(&visible_tile_ids);
+            if update_scheduler {
+                let request_plan = self.build_tile_request_plan(visible_tiles);
+                self.protected_tile_ids = request_plan.tiles().iter().map(|tile| tile.id).collect();
+                self.evict_far_zoom_layers(visible_tiles);
+                self.ensure_planned_tiles(visible_tiles, &request_plan);
+                self.enforce_cache_limits(visible_tiles);
+                self.tile_store.advance_generation();
+                self.tile_store.retain_renderable(
+                    request_plan
+                        .tiles()
+                        .iter()
+                        .map(|tile| tile.id)
+                        .chain(self.protected_tile_ids.iter().copied()),
+                );
+                self.tile_store.evict_oldest();
+                self.last_scheduler_update = Some(Instant::now());
+                self.last_visible_tile_ids = visible_tile_ids.clone();
+                self.last_integer_zoom = Some(self.state.camera().lower_tile_zoom());
+            }
         } else {
             self.protected_tile_ids.clear();
         }
@@ -1040,6 +1074,7 @@ impl RendererWorker {
             .filter(|planned| {
                 let tile_id = planned.id;
                 !self.loaded_tiles.contains_key(&tile_id)
+                    && !self.failed_tile_ids.contains(&tile_id)
                     && (!self.pending_tile_loads.contains(&tile_id)
                         || self.should_refresh_pending_tile(tile_id, planned.priority))
             })
@@ -1063,6 +1098,7 @@ impl RendererWorker {
             self.pending_tile_loads.insert(tile_id);
             self.pending_tile_priorities.insert(tile_id, priority);
             self.pending_metadata.insert(tile_id, metadata);
+            self.tile_store.mark_loading(tile_id);
             match self
                 .tile_requests
                 .send(TileLoaderRequest::Load(TileLoadRequest {
@@ -1180,22 +1216,37 @@ impl RendererWorker {
         )
     }
 
+    fn should_update_scheduler(&self, visible_tile_ids: &HashSet<TileId>) -> bool {
+        let current_integer_zoom = self.state.camera().lower_tile_zoom();
+        let zoom_changed = self.last_integer_zoom != Some(current_integer_zoom);
+        if zoom_changed {
+            return true;
+        }
+
+        let tile_grid_changed = visible_tile_ids != &self.last_visible_tile_ids;
+        if tile_grid_changed {
+            return true;
+        }
+
+        let elapsed_since_update = self
+            .last_scheduler_update
+            .map(|t| t.elapsed())
+            .unwrap_or(Duration::MAX);
+        if elapsed_since_update > SCHEDULER_UPDATE_INTERVAL {
+            return true;
+        }
+
+        false
+    }
+
     fn should_refresh_pending_tile(&self, tile_id: TileId, priority: TilePlanPriority) -> bool {
         if priority > TilePlanPriority::LookAhead {
             return false;
         }
-        let priority_improved = self
-            .pending_tile_priorities
+        self.pending_tile_priorities
             .get(&tile_id)
             .map(|pending| priority < *pending)
-            .unwrap_or(true);
-        let generation_stale = self
-            .pending_metadata
-            .get(&tile_id)
-            .map(|metadata| metadata.generation < self.request_generation)
-            .unwrap_or(true);
-
-        priority_improved || generation_stale
+            .unwrap_or(true)
     }
 
     fn prefetch_budget(&self) -> usize {
@@ -1359,6 +1410,14 @@ impl RendererWorker {
                 self.telemetry.gpu_evictions += 1;
             }
         }
+
+        let current_zoom = visible_tiles
+            .first()
+            .map(|tile| tile.id.z)
+            .unwrap_or(self.state.camera().lower_tile_zoom());
+        let max_distance = u32::from(self.cache_limits.max_zoom_distance_to_keep);
+        self.failed_tile_ids
+            .retain(|tile_id| tile_id.z.abs_diff(current_zoom) <= max_distance);
     }
 
     fn evict_far_zoom_layers(&mut self, visible_tiles: &[osm_renderer::VisibleTile]) {
@@ -1374,6 +1433,7 @@ impl RendererWorker {
             return;
         }
         self.last_stable_tile_ids.clear();
+        self.failed_tile_ids.clear();
         let max_distance = u32::from(self.cache_limits.max_zoom_distance_to_keep);
         let stale_loaded: Vec<TileId> = self
             .loaded_tiles
@@ -2316,6 +2376,7 @@ mod tests {
         worker.last_stable_tile_ids = vec![tile(4, 8, 8)];
         let visible_tiles = [osm_renderer::VisibleTile {
             id: tile(5, 16, 16),
+            overscaled_id: osm_renderer::OverscaledTileId::from_canonical(tile(5, 16, 16), 0),
             screen_x_px: 0.0,
             screen_y_px: 0.0,
             size_px: 256.0,
